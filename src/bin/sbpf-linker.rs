@@ -155,6 +155,17 @@ fn warn_if_builtins_missing(inputs: &[PathBuf]) {
     }
 }
 
+/// Whether any input references the `__svm_*` markers of the vector
+/// intrinsics, in which case the vector pass runs between LTO and codegen.
+fn uses_vector_intrinsics(inputs: &[PathBuf]) -> io::Result<bool> {
+    for input in inputs {
+        if sbpf_linker::vector::mentions_markers(&fs::read(input)?) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 #[derive(Debug, Parser)]
 #[command(version)]
 struct CommandLine {
@@ -471,11 +482,35 @@ fn main() -> anyhow::Result<()> {
     }
 
     warn_if_builtins_missing(&inputs);
+    let vector = uses_vector_intrinsics(&inputs)?;
 
     let inputs =
         inputs.iter().map(|p| LinkerInput::new_from_file(p.as_path()));
 
-    linker.link_to_file(inputs, &output, output_type, export_symbols)?;
+    if vector {
+        // Link and optimize to bitcode, lower the vector intrinsics on the
+        // whole program, then link the result again for BPF codegen.
+        let export_symbols: Vec<&str> = export_symbols.collect();
+        let linked = linker.link_to_buffer(
+            inputs,
+            OutputType::Bitcode,
+            export_symbols.iter().copied(),
+        )?;
+        if fatal_errors && linker.has_errors() {
+            return Err(anyhow::anyhow!(
+                "LLVM issued diagnostic with error severity"
+            ));
+        }
+        let lowered = sbpf_linker::vector::lower_bitcode(&linked)?;
+        linker.link_to_file(
+            [LinkerInput::new_from_buffer("svm-vector", &lowered)],
+            &output,
+            output_type,
+            export_symbols,
+        )?;
+    } else {
+        linker.link_to_file(inputs, &output, output_type, export_symbols)?;
+    }
 
     if fatal_errors && linker.has_errors() {
         return Err(anyhow::anyhow!(

@@ -6,7 +6,7 @@ use object::{
 };
 use sbpf_assembler::{OptimizationConfig, SbpfArch, astnode::ASTNode};
 use sbpf_linker::{
-    ProgramOptions, SbpfLinkerError, byteparser::parse_bytecode,
+    ProgramOptions, SbpfLinkerError, byteparser::parse_bytecode, link_program,
 };
 
 const STACK_FRAME_SIZE: i32 = 4096;
@@ -138,6 +138,54 @@ fn rodata_relocation_handles_interior_text_target() {
                 if label.name == ".text.__at__0x8" && *offset == 8
         )
     }));
+}
+
+#[test]
+fn vector_ops_pass_through_verbatim() {
+    // `ld v3, [r1 - 0x40]`, `hsum.d r0, v3` and `add.d v1, v2, v3`: CALL_IMM
+    // with src = 2, which is neither a syscall nor an internal call.
+    let words: [[u8; 8]; 3] = [
+        [0x85, 0x20, 0xc0, 0xff, 0x00, 0x0c, 0x00, 0x00],
+        [0x85, 0x20, 0, 0, 0x60, 0x00, 0x00, 0x70],
+        [0x85, 0x20, 0, 0, 0x43, 0x04, 0x00, 0x12],
+    ];
+    let mut text_bytes = words.concat();
+    text_bytes.extend_from_slice(&EXIT_INSTRUCTION);
+    for optimization in
+        [OptimizationConfig::enabled(), OptimizationConfig::disabled()]
+    {
+        let mut object = Object::new(
+            BinaryFormat::Elf,
+            Architecture::Sbf,
+            Endianness::Little,
+        );
+        let text = object.add_section(
+            Vec::new(),
+            b".text".to_vec(),
+            SectionKind::Text,
+        );
+        object.append_section_data(text, &text_bytes, 8);
+        object.add_symbol(Symbol {
+            name: b"entrypoint".to_vec(),
+            value: 0,
+            size: text_bytes.len() as u64,
+            kind: SymbolKind::Text,
+            scope: SymbolScope::Linkage,
+            weak: false,
+            section: SymbolSection::Section(text),
+            flags: SymbolFlags::None,
+        });
+        let bytes = object.write().expect("failed to write object");
+        let program = link_program(
+            &bytes,
+            ProgramOptions::new(optimization, SbpfArch::V3, STACK_FRAME_SIZE),
+        )
+        .expect("vector ops should link");
+        assert!(
+            program.windows(text_bytes.len()).any(|w| w == text_bytes),
+            "vector ops were not emitted verbatim"
+        );
+    }
 }
 
 fn create_object_with_rodata(size: usize) -> (Object<'static>, SectionId) {

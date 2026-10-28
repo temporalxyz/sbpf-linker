@@ -2,10 +2,12 @@ use crate::{ProgramOptions, SbpfLinkerError};
 
 use sbpf_assembler::ast::{AST, build_program};
 use sbpf_assembler::astnode::{ASTNode, GlobalDecl, Label, ROData};
-use sbpf_assembler::section::DebugSection;
+use sbpf_assembler::section::{CodeSection, DebugSection};
 use sbpf_assembler::{ProgramLayout, SbpfArch, Token};
 use sbpf_common::{
-    inst_param::Number, instruction::Instruction, opcode::Opcode,
+    inst_param::{Number, Register},
+    instruction::Instruction,
+    opcode::Opcode,
 };
 
 use either::Either;
@@ -27,11 +29,72 @@ fn decode_instruction_for_arch(
     data: &[u8],
     arch: SbpfArch,
 ) -> Result<Instruction, sbpf_common::errors::SBPFError> {
+    if let Some(instruction) = decode_vector_op(data) {
+        return Ok(instruction);
+    }
     if arch.is_v3() {
         Instruction::from_bytes_sbpf_v3(data)
     } else {
         Instruction::from_bytes(data)
     }
+}
+
+/// Vector ops are `call` with `src = 2` (see `crate::vector`). They are kept
+/// verbatim: neither syscalls nor internal calls, and never relocated.
+fn decode_vector_op(data: &[u8]) -> Option<Instruction> {
+    let [0x85, 0x20, off @ .., i0, i1, i2, i3] = *data.first_chunk::<8>()?
+    else {
+        return None;
+    };
+    let imm = [i0, i1, i2, i3];
+    Some(Instruction {
+        opcode: Opcode::Call,
+        dst: None,
+        src: Some(Register { n: 2 }),
+        // memory ops address `r1 + off`
+        off: Some(Either::Right(i16::from_le_bytes(off))),
+        imm: Some(Either::Right(Number::Int(i32::from_le_bytes(imm).into()))),
+        span: 0..8,
+    })
+}
+
+/// Marks a vector op whose `off` is parked in its span (see below).
+const VECTOR_OFF_SPAN_END: usize = usize::MAX;
+
+fn is_vector_op(instruction: &Instruction) -> bool {
+    instruction.opcode == Opcode::Call
+        && instruction.src.as_ref().is_some_and(|src| src.n == 2)
+}
+
+/// The assembler's validation rejects a `call` with an `off`, but vector
+/// memory ops use it. Park it in the span (only used for diagnostics) while
+/// the program is built, and put it back afterwards.
+fn hide_vector_offsets(nodes: &mut [ASTNode]) {
+    for node in nodes {
+        if let ASTNode::Instruction { instruction, .. } = node
+            && is_vector_op(instruction)
+            && let Some(Either::Right(off)) = instruction.off.take()
+        {
+            instruction.span = off as u16 as usize..VECTOR_OFF_SPAN_END;
+        }
+    }
+}
+
+fn restore_vector_offsets(layout: &mut ProgramLayout) {
+    let section = &layout.code_section;
+    let mut nodes = section.get_nodes().clone();
+    for node in &mut nodes {
+        if let ASTNode::Instruction { instruction, .. } = node
+            && is_vector_op(instruction)
+            && instruction.span.end == VECTOR_OFF_SPAN_END
+        {
+            let off = instruction.span.start as u16 as i16;
+            instruction.off = Some(Either::Right(off));
+            instruction.span = 0..8;
+        }
+    }
+    layout.code_section =
+        CodeSection::new(nodes, section.get_size()).with_arch(layout.arch);
 }
 
 // Staged rodata region. We collect these before emitting so we can sort by
@@ -641,8 +704,10 @@ pub fn parse_bytecode(
             .err()
             .unwrap_or_default();
 
+    hide_vector_offsets(&mut ast.nodes);
     match build_program(ast, arch, optimization) {
         Ok(mut parse_result) => {
+            restore_vector_offsets(&mut parse_result);
             if compile_errors.is_empty() {
                 parse_result.debug_sections = debug_sections;
                 Ok(parse_result)
