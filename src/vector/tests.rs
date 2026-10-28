@@ -960,8 +960,7 @@ fn load_runs_fuse_to_ldn() {
 }
 
 #[test]
-fn load_runs_need_one_object() {
-    // without inbounds the addresses may lie in different regions
+fn load_runs_fuse_without_inbounds() {
     let l = lower(
         r#"
 define void @f(ptr %p) {
@@ -975,7 +974,7 @@ define void @f(ptr %p) {
 "#,
     )
     .unwrap();
-    assert_eq!(ops(&l.words), [0x00, 0x00, 0x12, 0x01]);
+    assert_eq!(ops(&l.words), [0x0c, 0x12, 0x01]);
 }
 
 #[test]
