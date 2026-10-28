@@ -1,0 +1,256 @@
+name: Sync sbpf-linker-next
+
+on:
+  schedule:
+    - cron: "0 4 * * *"
+      timezone: "America/New_York"
+  workflow_dispatch:
+
+concurrency:
+  group: sync-sbpf-linker-next
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  MASTER_BRANCH: master
+  NEXT_BRANCH: sbpf-linker-next
+  SYNC_BRANCH: automation/sync-master
+  PIN_BRANCH: automation/track-sbpf
+  SBPF_REPOSITORY: https://github.com/blueshift-gg/sbpf.git
+
+jobs:
+  sync_master:
+    name: Merge master into sbpf-linker-next
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Create the app token
+        id: app_token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.SYNC_APP_CLIENT_ID }}
+          private-key: ${{ secrets.SYNC_APP_PRIVATE_KEY }}
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.MASTER_BRANCH }}
+          fetch-depth: 0
+          token: ${{ steps.app_token.outputs.token }}
+
+      - name: Propose and verify the merge
+        id: publish
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Bail if next branch doesn't exist
+          if ! git ls-remote --exit-code --heads origin "$NEXT_BRANCH" >/dev/null; then
+            echo "::error::$NEXT_BRANCH does not exist, so there is nothing to synchronize. If it was removed by accident, restore it."
+            exit 1
+          fi
+
+          # Check if there's an open sync PR
+          pr=$(gh pr list --state open --base "$NEXT_BRANCH" --head "$SYNC_BRANCH" \
+            --json number --jq '.[0].number // empty')
+
+          # Bail if next is already up-to-date with master
+          if git merge-base --is-ancestor "origin/$MASTER_BRANCH" "origin/$NEXT_BRANCH"; then
+            echo "::notice::$NEXT_BRANCH already contains every commit from $MASTER_BRANCH."
+            exit 0
+          fi
+
+          # Branch off of the sync PR branch if it exists. Otherwise, starts fresh from the next branch
+          if git ls-remote --exit-code --heads origin "$SYNC_BRANCH" >/dev/null; then
+            git fetch --no-tags origin "$SYNC_BRANCH"
+            git checkout -q -B "$SYNC_BRANCH" "origin/$SYNC_BRANCH"
+          else
+            git fetch --no-tags origin "$MASTER_BRANCH"
+            git checkout -q -B "$SYNC_BRANCH" "origin/$NEXT_BRANCH"
+          fi
+
+          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" merge --no-ff -q --no-edit "origin/$MASTER_BRANCH" || {
+            echo "::error::$MASTER_BRANCH does not merge cleanly into $NEXT_BRANCH. Resolve it on $SYNC_BRANCH, then dispatch this workflow from $SYNC_BRANCH to continue."
+            exit 1
+          }
+
+          # Reapply the patch block if necessary
+          yq -oy -e '.patch."crates-io"' Cargo.toml >/dev/null || cat .github/sbpf-patch.toml >> Cargo.toml
+          if ! git diff --quiet; then
+            git add Cargo.toml
+            git -c user.name="github-actions[bot]" \
+                -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+                commit -q --amend --no-edit
+          fi
+
+          git push origin "HEAD:refs/heads/$SYNC_BRANCH"
+
+          if [[ -z "$pr" ]]; then
+            body=$(printf '%s\n' \
+              "Merges \`$MASTER_BRANCH\` into \`$NEXT_BRANCH\`. CI runs on the merge commit of this pull request.")
+            pr_url=$(gh pr create --base "$NEXT_BRANCH" --head "$SYNC_BRANCH" \
+              --title "chore: merge $MASTER_BRANCH into $NEXT_BRANCH" \
+              --body "$body" | tail -n 1)
+            pr=${pr_url##*/}
+          else
+            echo "updating open sync pull request #$pr"
+          fi
+
+          echo "verifying pull request #$pr"
+
+          # Wait for the pull request's checks to be created, then for them to finish.
+          deadline=$((SECONDS + 600))
+          until [[ -n "$(gh pr checks "$pr" --json state --jq '.[].state' || true)" ]]; do
+            if (( SECONDS >= deadline )); then
+              echo "::error::no checks were started for pull request #$pr. If they are waiting on approval, approve them there and re-run this job, or merge it by hand. It is left open for a maintainer."
+              exit 1
+            fi
+            sleep 20
+          done
+
+          head=$(gh pr view "$pr" --json headRefOid --jq .headRefOid)
+
+          if gh pr checks "$pr" --watch --fail-fast; then
+            {
+              echo "pr=$pr"
+              echo "head=$head"
+              echo "land=true"
+            } >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::the checks for pull request #$pr did not pass, so the merge is not verified. It is left open for a maintainer, and the next run will retry."
+            echo "The checks for pull request #$pr did not pass, so the merge is not verified. It is left open for a maintainer." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+      - name: Merge with a merge commit
+        if: steps.publish.outputs.land == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+          PR: ${{ steps.publish.outputs.pr }}
+          HEAD: ${{ steps.publish.outputs.head }}
+        run: gh pr merge "$PR" --merge --match-head-commit "$HEAD"
+
+  track_sbpf:
+    name: Track the sbpf pin
+    needs: sync_master
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Create the app token
+        id: app_token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.SYNC_APP_CLIENT_ID }}
+          private-key: ${{ secrets.SYNC_APP_PRIVATE_KEY }}
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.NEXT_BRANCH }}
+          fetch-depth: 0
+          token: ${{ steps.app_token.outputs.token }}
+
+      - name: Track sbpf master
+        id: bump
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Build on the pull request's branch when it is available, so a change made
+          # there survives and the commit this run makes still descends from it.
+          pin_sha=$(git ls-remote origin "refs/heads/$PIN_BRANCH" | cut -f1)
+          if [[ -n "$pin_sha" ]]; then
+            git fetch --no-tags origin "$PIN_BRANCH"
+            git checkout -q -B "$PIN_BRANCH" "origin/$PIN_BRANCH"
+
+            if ! git merge-base "origin/$NEXT_BRANCH" "$PIN_BRANCH" >/dev/null 2>&1; then
+              echo "::error::$PIN_BRANCH and $NEXT_BRANCH share no history and cannot be merged."
+              exit 1
+            fi
+
+            git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" merge -q --no-edit "origin/$NEXT_BRANCH" || {
+              echo "::error::$PIN_BRANCH conflicts with $NEXT_BRANCH. Resolve the conflict on $PIN_BRANCH, then re-run this workflow."
+              exit 1
+            }
+          fi
+
+          locked_sbpf_rev() {
+            yq -p toml -oy -r \
+              '.package[] | select(.name == "sbpf-assembler") | .source | split("#") | .[1] // ""' Cargo.lock | head -n1
+          }
+
+          old=$(locked_sbpf_rev)
+          # Move the sbpf packages onto the git source. This job carries no cargo cache, so
+          # the fetch resolves master as it is now; a cache would pin a stale revision.
+          cargo update -p sbpf-assembler -p sbpf-common
+
+          sbpf_rev=$(locked_sbpf_rev)
+          [[ -n "$sbpf_rev" ]] \
+            || { echo "::error::the sbpf dependencies are not on a git source after the update"; exit 1; }
+
+          # Second pass: leave the lock settled, holding the revision
+          cargo update -p sbpf-assembler -p sbpf-common --precise "$sbpf_rev"
+
+          {
+            echo "old=$old"
+            echo "rev=$sbpf_rev"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Commit the bump
+        id: commit
+        shell: bash
+        env:
+          REV: ${{ steps.bump.outputs.rev }}
+        run: |
+          set -euo pipefail
+
+          if git diff --quiet; then
+            echo "::notice::already tracking sbpf master; nothing to commit."
+            exit 0
+          fi
+
+          git add Cargo.toml Cargo.lock
+          git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit -qm "chore: track sbpf master at ${REV:0:12}"
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Push the bump and open the pull request
+        if: steps.commit.outputs.changed == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+          OLD: ${{ steps.bump.outputs.old }}
+          REV: ${{ steps.bump.outputs.rev }}
+        run: |
+          set -euo pipefail
+
+          git push origin "HEAD:refs/heads/$PIN_BRANCH"
+
+          title="chore: track sbpf master at ${REV:0:12}"
+
+          if [[ -n "$OLD" ]]; then
+            moved="Moves the sbpf pin in \`Cargo.lock\` from \`${OLD:0:12}\` to \`${REV:0:12}\`."
+            upstream="Upstream diff: ${SBPF_REPOSITORY%.git}/compare/${OLD}...${REV}"
+          else
+            moved="Moves the sbpf pin in \`Cargo.lock\` to \`${REV:0:12}\`."
+            upstream="Upstream: ${SBPF_REPOSITORY%.git}/commit/${REV}"
+          fi
+
+          body=$(printf '%s\n' "$moved" "" "$upstream" "" \
+            "Merge this with a merge commit; DO NOT squash or rebase \`${NEXT_BRANCH}\`.")
+
+          # Reuse the pull request an earlier run left open, rather than failing
+          # because one already exists for this branch.
+          pr=$(gh pr list --state open --base "$NEXT_BRANCH" --head "$PIN_BRANCH" \
+            --json number --jq '.[0].number // empty')
+          if [[ -n "$pr" ]]; then
+            gh pr edit "$pr" --title "$title" --body "$body"
+          else
+            gh pr create --base "$NEXT_BRANCH" --head "$PIN_BRANCH" \
+              --title "$title" --body "$body"
+          fi

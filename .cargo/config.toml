@@ -1,0 +1,3 @@
+[alias]
+install-with-llvm-main = "run -p xtask"
+update-llvm-main = "run -p xtask -- update-llvm"

@@ -1,0 +1,60 @@
+<h1 align="center">
+  SBPF Linker
+</h1>
+<p align="center">
+  An upstream BPF linker to relink upstream BPF binaries into an SBPF V0/V3 compatible binary format.
+</p>
+<p align="center">
+  <a href="https://codecov.io/gh/blueshift-gg/sbpf-linker">
+    <img src="https://codecov.io/gh/blueshift-gg/sbpf-linker/graph/badge.svg" alt="codecov">
+  </a>
+</p>
+
+## Installation
+
+### cargo binstall (recommended for solana devs)
+
+The recommended installation method is
+[`cargo-binstall`](https://github.com/cargo-bins/cargo-binstall):
+
+```sh
+cargo binstall sbpf-linker
+```
+
+### cargo install (requires toolchain that ships a shared LLVM library)
+
+A source install that selects the LLVM shared library at runtime (make sure the linker is invoked from rustc nightly with minimum nightly-2026-08-05)
+
+```sh
+cargo install sbpf-linker
+```
+
+### Generate a Program
+
+```sh
+cargo generate --git https://github.com/blueshift-gg/solana-upstream-bpf-template
+```
+
+```sh
+cargo +nightly build-bpf
+```
+
+## Compiler builtins
+
+Pass `solana-compiler-builtins` as a regular linker input before Rust's `libcompiler_builtins.rlib`. The Solana implementations use `weak_odr` linkage, while Rust's use `weak` linkage. When both define the same symbol, LLVM retains the first definition encountered, giving the Solana implementations precedence. Program-defined implementations still override both.
+
+The linker emits a warning if `solana-compiler-builtins` is missing from the inputs.
+
+When building a Solana program with Cargo, add `solana-compiler-builtins` as a
+direct dependency from the program's project directory:
+
+```sh
+cargo add solana-compiler-builtins
+```
+
+Declaring the dependency alone does not guarantee that rustc will include it in
+the linker inputs. Reference the crate from `src/lib.rs` to ensure it is linked:
+
+```rust
+use solana_compiler_builtins as _;
+```

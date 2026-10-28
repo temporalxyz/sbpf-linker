@@ -1,0 +1,220 @@
+name: CI
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master, sbpf-linker-next]
+  pull_request:
+    branches: [master, sbpf-linker-next]
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve pinned nightly
+        id: pinned
+        run: |
+          channel=$(yq -e '.toolchain.channel' rust-toolchain.toml)
+          echo "toolchain=$channel" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.pinned.outputs.toolchain }}
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve pinned nightly
+        id: pinned
+        run: |
+          channel=$(yq -e '.toolchain.channel' rust-toolchain.toml)
+          echo "toolchain=$channel" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.pinned.outputs.toolchain }}
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: >-
+          cargo clippy --no-default-features
+          --features bpf-linker/llvm-23,bpf-linker/no-llvm-linking
+          --all-targets -- -D warnings
+
+  cargo-install:
+    name: cargo install (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-24.04
+          - macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve pinned nightly
+        id: pinned
+        run: |
+          channel=$(yq -e '.toolchain.channel' rust-toolchain.toml)
+          echo "toolchain=$channel" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.pinned.outputs.toolchain }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Install from source using Rust's LLVM
+        run: >-
+          cargo install --path . --locked
+          --root target/cargo-install
+      - name: Verify installed binary
+        run: |
+          output=$(rustup run "${{ steps.pinned.outputs.toolchain }}" \
+            target/cargo-install/bin/sbpf-linker --version)
+          echo "$output"
+          grep -F "LLVM dynamically linked at runtime" <<< "$output"
+      - name: Verify LLVM is loaded through the runtime proxy
+        run: |
+          case "$RUNNER_OS" in
+            Linux)
+              ! readelf -d target/cargo-install/bin/sbpf-linker |
+                grep -F libLLVM
+              ;;
+            macOS)
+              ! otool -L target/cargo-install/bin/sbpf-linker |
+                grep -F libLLVM
+              ;;
+          esac
+
+  test-harness:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve pinned nightly
+        id: pinned
+        run: |
+          channel=$(yq -e '.toolchain.channel' rust-toolchain.toml)
+          echo "toolchain=$channel" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.pinned.outputs.toolchain }}
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+      - name: Install FileCheck
+        run: sudo apt-get update && sudo apt-get install -y llvm-18-tools
+      - run: cargo test -- --nocapture
+        
+  coverage:
+    name: coverage (nightly)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+      id-token: write
+    env:
+      IGNORE_FILENAME_REGEX: 'src/bin/sbpf-linker\.rs$'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve pinned nightly
+        id: pinned
+        run: |
+          channel=$(yq -e '.toolchain.channel' rust-toolchain.toml)
+          echo "toolchain=$channel" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.pinned.outputs.toolchain }}
+          components: rust-src, llvm-tools-preview
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install FileCheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm-18-tools
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      # The harness normally builds this sysroot itself. '
+      # Build it first so host coverage flags do not reach the nested bpfel Cargo build.  
+      # TODO: if ci duration becomes an issue, extract sysroot creation into an xtask command to avoid running
+      # the compile-test suite twice.
+      - name: Build BPF sysroot
+        run: cargo test --test tests compile_test -- --nocapture
+
+      - name: Generate code coverage
+        env:
+          BPFEL_SYSROOT_DIR: ${{ github.workspace }}/target/sysroot
+          MINIMUM_LINE_COVERAGE: 83
+        run: |
+          set -o pipefail
+
+          coverage_status=0 
+          cargo llvm-cov \
+            --package sbpf-linker \
+            --all-targets \
+            --color never \
+            --ignore-filename-regex "$IGNORE_FILENAME_REGEX" \
+            --fail-under-lines "$MINIMUM_LINE_COVERAGE" \
+            | tee coverage.txt || coverage_status=$?
+
+          {
+            echo "## Code coverage"
+            echo
+            echo "Required line coverage: **${MINIMUM_LINE_COVERAGE}%**"
+            echo
+            echo '```text'
+            cat coverage.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          exit "$coverage_status"
+
+      - name: Export LCOV
+        if: ${{ !cancelled() }}
+        run: |
+          cargo llvm-cov report \
+            --package sbpf-linker \
+            --lcov \
+            --output-path lcov.info \
+            --ignore-filename-regex "$IGNORE_FILENAME_REGEX" \
+            --color never
+
+      - name: Upload coverage to Codecov
+        if: ${{ !cancelled() }}
+        uses: codecov/codecov-action@v5
+        with:
+          use_oidc: true
+          files: lcov.info
+          fail_ci_if_error: false
+
+  sbpf-source:
+    name: Ensure sbpf dependency is overridden only on sbpf-linker-next branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check the sbpf source
+        env:
+          BRANCH: ${{ github.base_ref || github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          has_patch="absent"
+          yq -oy -e '.patch."crates-io"' Cargo.toml >/dev/null 2>&1 && has_patch="present"
+
+          case "$BRANCH" in
+            sbpf-linker-next) [[ "$has_patch" == "present" ]] || { echo "::error::sbpf-linker-next must carry the sbpf [patch.crates-io] block"; exit 1; } ;;
+            master)           [[ "$has_patch" == "absent" ]]  || { echo "::error::master must not carry the sbpf [patch.crates-io] block"; exit 1; } ;;
+            *)                echo "::notice::not master or sbpf-linker-next ($BRANCH); nothing to check"; exit 0 ;;
+          esac
+
+          echo "sbpf source is correct for $BRANCH"
