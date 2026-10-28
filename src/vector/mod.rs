@@ -30,10 +30,10 @@ use bpf_linker::llvm_sys::{
     },
 };
 
-use ops::{MARKER_PREFIX, MOV, OpInfo, XOR};
+use ops::{Kind, LD, LDN, MARKER_PREFIX, MOV, OpInfo, ST, STN, XOR};
 use regalloc::{
     ALL_REGS, AllocError, Allocation, Inst, InstKind, Move, Phi, Reg, RegSet,
-    Tok,
+    Run, Tok,
 };
 
 /// Errors in the input program, one message per problem.
@@ -115,7 +115,11 @@ enum Site {
     Op {
         call: LLVMValueRef,
         op: &'static OpInfo,
-        scalar: Option<LLVMValueRef>,
+        mode: u8,
+        /// Operand numbers of the scalar and the mask. They are read when
+        /// the op is emitted: an earlier op may have replaced the value.
+        scalar: Option<u32>,
+        mask: Option<u32>,
         imm8: u8,
     },
     Select(LLVMValueRef),
@@ -133,6 +137,69 @@ impl Site {
     }
 }
 
+/// Vector uses, scalar (`r1`), mask (`r2`) and immediates of a marker call.
+type MarkerOperands =
+    (Vec<Option<Tok>>, Option<LLVMValueRef>, Option<LLVMValueRef>, [u8; 2]);
+
+/// A load or store that can join a run: `base + offset`, `count` = n of
+/// the `ldn`/`stn` it is a register of, 0 for a plain `ld`/`st`.
+struct RunKey {
+    store: bool,
+    base: LLVMValueRef,
+    offset: i64,
+    count: u8,
+}
+
+/// Numbers the runs among the allocator instructions of one block: loads
+/// (stores) next to each other, from one base at offsets 64 apart.
+fn assign_runs(insts: &mut [Inst], keys: &[Option<RunKey>], next: &mut u32) {
+    let mut i = 0;
+    while i < insts.len() {
+        let Some(first) = &keys[i] else {
+            i += 1;
+            continue;
+        };
+        let mut j = i + 1;
+        while j < insts.len() && j - i < usize::from(regalloc::NUM_REGS) {
+            match (&keys[j - 1], &keys[j]) {
+                (Some(prev), Some(key))
+                    if key.store == first.store
+                        && key.base == first.base
+                        && key.count == first.count
+                        && key.offset == prev.offset + 64 =>
+                {
+                    j += 1
+                }
+                _ => break,
+            }
+        }
+        if j - i >= 2 {
+            for (k, inst) in insts[i..j].iter_mut().enumerate() {
+                inst.run =
+                    Some(Run { id: *next, k: k as u8, store: first.store });
+            }
+            *next += 1;
+        }
+        i = j;
+    }
+}
+
+unsafe fn may_access_memory(inst: LLVMValueRef) -> bool {
+    use LLVMOpcode::*;
+    matches!(
+        unsafe { LLVMGetInstructionOpcode(inst) },
+        LLVMLoad
+            | LLVMStore
+            | LLVMAtomicRMW
+            | LLVMAtomicCmpXchg
+            | LLVMFence
+            | LLVMCall
+            | LLVMInvoke
+            | LLVMCallBr
+            | LLVMVAArg
+    )
+}
+
 /// One function with vector tokens, in allocator form.
 struct Function {
     func: regalloc::Func,
@@ -148,7 +215,7 @@ struct Function {
 struct Pass {
     module: LLVMModuleRef,
     context: LLVMContextRef,
-    markers: HashMap<LLVMValueRef, &'static OpInfo>,
+    markers: HashMap<LLVMValueRef, (&'static OpInfo, u8)>,
     errors: Vec<String>,
 }
 
@@ -204,6 +271,16 @@ unsafe fn users(value: LLVMValueRef) -> Vec<LLVMValueRef> {
         u = unsafe { LLVMGetNextUse(u) };
     }
     users
+}
+
+/// Whether the index (operand 1) of a two-table permute is used only by
+/// `call` and the first table (operand 0) is used again. The permute ties the
+/// first table; tying the index instead (`perm2i`) then saves a copy.
+unsafe fn index_dies_first(call: LLVMValueRef) -> bool {
+    unsafe {
+        users(LLVMGetOperand(call, 1)).len() == 1
+            && users(LLVMGetOperand(call, 0)).len() > 1
+    }
 }
 
 unsafe fn is_undef(value: LLVMValueRef) -> bool {
@@ -285,10 +362,16 @@ impl Pass {
                     if LLVMGetFirstUse(f).is_null() {
                         continue;
                     }
-                    self.error(
-                        None,
-                        format!("unknown vector intrinsic marker `{name}`"),
-                    );
+                    let message = match ops::unmasked(name) {
+                        Some(op) => format!(
+                            "`{name}`: `{}` has no such mask mode",
+                            op.name
+                        ),
+                        None => {
+                            format!("unknown vector intrinsic marker `{name}`")
+                        }
+                    };
+                    self.error(None, message);
                     continue;
                 };
                 self.markers.insert(f, op);
@@ -483,7 +566,7 @@ impl Pass {
                         continue;
                     }
                     let callee = LLVMGetCalledValue(inst);
-                    if let Some(op) = self.markers.get(&callee) {
+                    if let Some((op, _)) = self.markers.get(&callee) {
                         if op.kind.defines_vector() {
                             new_token(inst, &mut tokens);
                         }
@@ -536,6 +619,7 @@ impl Pass {
             };
             let mut sites = Vec::with_capacity(bbs.len());
             let mut preds = vec![0; bbs.len()];
+            let mut next_run = 0;
             for &bb in &bbs {
                 let mut block = regalloc::Block::default();
                 let mut block_sites = Vec::new();
@@ -547,6 +631,10 @@ impl Pass {
                         preds[succ] += 1;
                     }
                 }
+                // Whether an instruction that may access memory precedes
+                // `inst` since the last allocator instruction.
+                let mut barrier = false;
+                let mut run_keys = Vec::new();
                 for inst in instructions(bb) {
                     if let Some(&def) = token_of.get(&inst)
                         && !LLVMIsAPHINode(inst).is_null()
@@ -583,31 +671,59 @@ impl Pass {
                             def: Some(def),
                             uses,
                             origin: block_sites.len(),
+                            run: None,
                         });
                         block_sites.push(Site::Select(inst));
+                        run_keys.push(None);
+                        barrier = false;
                         continue;
                     }
                     if LLVMIsACallInst(inst).is_null() {
+                        barrier |= may_access_memory(inst);
                         continue;
                     }
                     let callee = LLVMGetCalledValue(inst);
-                    if let Some(&op) = self.markers.get(&callee) {
+                    if let Some(&(op, mode)) = self.markers.get(&callee) {
                         let def = token_of.get(&inst).copied();
-                        if let Some((uses, scalar, imm8)) =
-                            self.marker_operands(f, inst, op, &operand)
+                        if let Some((mut uses, scalar, mask, imms)) =
+                            self.marker_operands(f, inst, op, mode, &operand)
                         {
+                            let (op, imms) = match ops::perm2i_of(op, imms[0])
+                            {
+                                Some((perm2i, imm8))
+                                    if mode != 1 && index_dies_first(inst) =>
+                                {
+                                    uses.swap(0, 1);
+                                    (perm2i, [imm8, imms[1]])
+                                }
+                                _ => (op, imms),
+                            };
+                            run_keys.push(
+                                (!barrier)
+                                    .then(|| {
+                                        self.run_key(op, mode, scalar, imms)
+                                    })
+                                    .flatten(),
+                            );
                             block.insts.push(Inst {
-                                kind: InstKind::Op { tied: op.kind.tied() },
+                                kind: InstKind::Op { tied: op.tied(mode) },
                                 def,
                                 uses,
                                 origin: block_sites.len(),
+                                run: None,
                             });
+                            let vectors = op.vector_args(mode) as u32;
                             block_sites.push(Site::Op {
                                 call: inst,
                                 op,
-                                scalar,
-                                imm8,
+                                mode,
+                                scalar: scalar.map(|_| vectors),
+                                mask: mask.map(|_| {
+                                    vectors + u32::from(scalar.is_some())
+                                }),
+                                imm8: imms[0],
                             });
+                            barrier = false;
                         }
                     } else if LLVMIsAInlineAsm(callee).is_null()
                         && (LLVMIsAFunction(callee).is_null()
@@ -623,10 +739,16 @@ impl Pass {
                             def: None,
                             uses: Vec::new(),
                             origin: block_sites.len(),
+                            run: None,
                         });
                         block_sites.push(Site::Call(inst, site));
+                        run_keys.push(None);
+                        barrier = false;
+                    } else {
+                        barrier = true;
                     }
                 }
+                assign_runs(&mut block.insts, &run_keys, &mut next_run);
                 func.blocks.push(block);
                 sites.push(block_sites);
             }
@@ -634,22 +756,25 @@ impl Pass {
         }
     }
 
-    /// Splits a marker call's arguments into vector uses, the scalar and the
-    /// imm8, reporting malformed ones.
+    /// Splits a marker call's arguments into vector uses, the scalar, the
+    /// mask and the immediates, reporting malformed ones.
     unsafe fn marker_operands(
         &mut self,
         f: LLVMValueRef,
         call: LLVMValueRef,
         op: &OpInfo,
+        mode: u8,
         operand: &dyn Fn(LLVMValueRef) -> Result<Option<Tok>, &'static str>,
-    ) -> Option<(Vec<Option<Tok>>, Option<LLVMValueRef>, u8)> {
+    ) -> Option<MarkerOperands> {
         unsafe {
             let kind = op.kind;
             let marker = value_name(LLVMGetCalledValue(call));
             let nargs = LLVMGetNumArgOperands(call) as usize;
-            let expected = kind.vector_args()
+            let vectors = op.vector_args(mode);
+            let expected = vectors
                 + usize::from(kind.has_scalar())
-                + usize::from(kind.has_imm());
+                + usize::from(op.reads_mask(mode))
+                + kind.imm_args();
             if nargs != expected {
                 self.error(
                     Some(f),
@@ -659,7 +784,7 @@ impl Pass {
             }
             let mut ok = true;
             let mut uses = Vec::new();
-            for k in 0..kind.vector_args() {
+            for k in 0..vectors {
                 match operand(LLVMGetOperand(call, k as u32)) {
                     Ok(v) => uses.push(v),
                     Err(origin) => {
@@ -675,32 +800,110 @@ impl Pass {
                     }
                 }
             }
-            let scalar = kind
-                .has_scalar()
-                .then(|| LLVMGetOperand(call, kind.vector_args() as u32));
-            let mut imm8 = 0;
-            if kind.has_imm() {
-                let imm = LLVMGetOperand(call, nargs as u32 - 1);
-                if LLVMIsAConstantInt(imm).is_null() {
+            let mut next = vectors as u32;
+            let mut scalar_arg = |present: bool| {
+                present.then(|| {
+                    next += 1;
+                    LLVMGetOperand(call, next - 1)
+                })
+            };
+            let scalar = scalar_arg(kind.has_scalar());
+            let mask = scalar_arg(op.reads_mask(mode));
+            let mut imms = [0; 2];
+            for (k, imm) in imms.iter_mut().enumerate().take(kind.imm_args()) {
+                let value = LLVMGetOperand(call, next + k as u32);
+                if LLVMIsAConstantInt(value).is_null() {
                     self.error(
                         Some(f),
                         format!("the immediate of `{marker}` is not a compile-time constant"),
                     );
                     ok = false;
                 } else {
-                    let value = LLVMConstIntGetZExtValue(imm);
-                    if op.imm.accepts(value) {
-                        imm8 = value as u8;
-                    } else {
-                        self.error(
-                            Some(f),
-                            format!("immediate {value:#x} is out of range for `{}`", op.name),
-                        );
-                        ok = false;
-                    }
+                    *imm = LLVMConstIntGetZExtValue(value).min(256) as u16;
                 }
             }
-            ok.then_some((uses, scalar, imm8))
+            if ok {
+                let valid = match kind {
+                    // register k of n
+                    Kind::Ldn | Kind::Stn => {
+                        (2..=30).contains(&imms[1]) && imms[0] < imms[1]
+                    }
+                    _ => op.imm.accepts(u64::from(imms[0])),
+                };
+                if !valid {
+                    let value = if kind.imm_args() == 2 {
+                        format!("{} of {}", imms[0], imms[1])
+                    } else {
+                        format!("{:#x}", imms[0])
+                    };
+                    self.error(
+                        Some(f),
+                        format!(
+                            "immediate {value} is out of range for `{}`",
+                            op.name
+                        ),
+                    );
+                    ok = false;
+                }
+            }
+            ok.then_some((uses, scalar, mask, imms.map(|imm| imm as u8)))
+        }
+    }
+
+    /// What makes a marker call a candidate member of a load or store run.
+    unsafe fn run_key(
+        &self,
+        op: &OpInfo,
+        mode: u8,
+        scalar: Option<LLVMValueRef>,
+        imms: [u8; 2],
+    ) -> Option<RunKey> {
+        let address = scalar?;
+        match op.kind {
+            Kind::Ldn | Kind::Stn => Some(RunKey {
+                store: op.kind == Kind::Stn,
+                base: address,
+                offset: i64::from(imms[0]) * 64,
+                count: imms[1],
+            }),
+            // Only loads (stores) from one allocated object: fused, they
+            // need the whole span in one region.
+            _ if mode == 0 && (op.code == LD || op.code == ST) => {
+                let (base, offset) = unsafe { self.inbounds_offset(address)? };
+                Some(RunKey { store: op.code == ST, base, offset, count: 0 })
+            }
+            _ => None,
+        }
+    }
+
+    /// `address` as `base + offset` through inbounds GEPs with constant
+    /// indices.
+    unsafe fn inbounds_offset(
+        &self,
+        mut address: LLVMValueRef,
+    ) -> Option<(LLVMValueRef, i64)> {
+        unsafe {
+            let mut offset = 0i64;
+            loop {
+                let opcode = if !LLVMIsAInstruction(address).is_null() {
+                    LLVMGetInstructionOpcode(address)
+                } else if !LLVMIsAConstantExpr(address).is_null() {
+                    LLVMGetConstOpcode(address)
+                } else {
+                    break;
+                };
+                if opcode != LLVMOpcode::LLVMGetElementPtr
+                    || LLVMIsInBounds(address) == 0
+                {
+                    break;
+                }
+                let Some((base, step)) = self.constant_step(address) else {
+                    break;
+                };
+                offset = offset.checked_add(step)?;
+                address = base;
+            }
+            Some((address, offset))
         }
     }
 
@@ -713,11 +916,12 @@ impl Pass {
         unsafe {
             if !LLVMIsACallInst(user).is_null() {
                 let callee = LLVMGetCalledValue(user);
-                if let Some(op) = self.markers.get(&callee) {
+                if let Some(&(op, mode)) = self.markers.get(&callee) {
                     let args = LLVMGetNumArgOperands(user) as usize;
-                    let vector_arg = (0..args.min(op.kind.vector_args()))
+                    let vectors = op.vector_args(mode);
+                    let vector_arg = (0..args.min(vectors))
                         .any(|k| LLVMGetOperand(user, k as u32) == token);
-                    let other_arg = (op.kind.vector_args()..args)
+                    let other_arg = (vectors..args)
                         .any(|k| LLVMGetOperand(user, k as u32) == token);
                     return (!vector_arg || other_arg).then(|| {
                         format!(
@@ -783,13 +987,13 @@ impl Pass {
                     slot
                 })
                 .collect();
-            let (ld, st) = (
-                ops::by_marker("__svm_ld").unwrap(),
-                ops::by_marker("__svm_st").unwrap(),
-            );
+            let op_info = |name| ops::by_marker(name).unwrap().0;
+            let (ld, st) = (op_info("__svm_ld"), op_info("__svm_st"));
+            let (ldn, stn) = (op_info("__svm_ldn"), op_info("__svm_stn"));
             for (b, (block, sites)) in
                 function.func.blocks.iter().zip(&function.sites).enumerate()
             {
+                let fused = fuse_runs(&block.insts, &allocation.reg);
                 for (i, inst) in block.insts.iter().enumerate() {
                     let site = &sites[inst.origin];
                     match (inst.kind, site) {
@@ -807,6 +1011,7 @@ impl Pass {
                                 st,
                                 word,
                                 Some(slots[slot as usize]),
+                                None,
                                 site.anchor(),
                             );
                         }
@@ -819,23 +1024,67 @@ impl Pass {
                                 ld,
                                 word,
                                 Some(slots[slot as usize]),
+                                None,
                                 site.anchor(),
                             );
                         }
-                        (_, &Site::Op { call, op, scalar, imm8 }) => {
+                        (
+                            _,
+                            &Site::Op { call, op, mode, scalar, mask, imm8 },
+                        ) => {
                             LLVMPositionBuilderBefore(builder, call);
                             if let Some((dst, src)) = allocation.pre_copy[b][i]
                             {
                                 self.emit_words(builder, &[mov(dst, src)]);
                             }
+                            let scalar =
+                                scalar.map(|k| LLVMGetOperand(call, k));
+                            let mask = mask.map(|k| LLVMGetOperand(call, k));
                             let out = reg(inst.def);
-                            let first = usize::from(op.kind.tied());
+                            let first = usize::from(op.tied(mode));
                             let in0 =
                                 inst.uses.get(first).map_or(0, |&u| reg(u));
                             let in1 = inst
                                 .uses
                                 .get(first + 1)
                                 .map_or(0, |&u| reg(u));
+                            // A run of consecutive registers is one `ldn` or
+                            // `stn` at its first member; the registers of an
+                            // unfused `ldn` or `stn` are single `ld`s / `st`s.
+                            let member =
+                                matches!(op.kind, Kind::Ldn | Kind::Stn)
+                                    .then_some(imm8);
+                            let (op, code, imm8, mut scalar) = match fused[i] {
+                                0 => continue,
+                                1 if op.kind == Kind::Ldn => {
+                                    (ld, LD, 0, scalar)
+                                }
+                                1 if op.kind == Kind::Stn => {
+                                    (st, ST, 0, scalar)
+                                }
+                                1 => (op, op.code, imm8, scalar),
+                                n if inst.def.is_some() => {
+                                    (ldn, LDN, n, scalar)
+                                }
+                                n => (stn, STN, n, scalar),
+                            };
+                            if let (Some(p), Some(k @ 1..)) = (scalar, member)
+                            {
+                                // register k of an `ldn` / `stn`: p + 64k
+                                let mut index = [LLVMConstInt(
+                                    LLVMInt64TypeInContext(self.context),
+                                    u64::from(k) * 64,
+                                    0,
+                                )];
+                                scalar = Some(LLVMBuildInBoundsGEP2(
+                                    builder,
+                                    LLVMInt8TypeInContext(self.context),
+                                    p,
+                                    index.as_mut_ptr(),
+                                    1,
+                                    c"".as_ptr(),
+                                ));
+                            }
                             let (scalar, off) = match scalar {
                                 Some(p) if op.is_memory() => {
                                     let (base, off) = self.split_address(p);
@@ -843,12 +1092,16 @@ impl Pass {
                                 }
                                 _ => (scalar, 0),
                             };
-                            let word = ops::with_off(
-                                ops::encode(op.code, imm8, out, in0, in1),
-                                off,
+                            let word = ops::with_mode(
+                                ops::with_off(
+                                    ops::encode(code, imm8, out, in0, in1),
+                                    off,
+                                ),
+                                mode,
                             );
-                            let result =
-                                self.emit_op(builder, op, word, scalar, call);
+                            let result = self.emit_op(
+                                builder, op, word, scalar, mask, call,
+                            );
                             if op.kind.defines_scalar() {
                                 LLVMReplaceAllUsesWith(call, result);
                             }
@@ -971,6 +1224,7 @@ impl Pass {
         op: &OpInfo,
         word: u64,
         scalar: Option<LLVMValueRef>,
+        mask: Option<LLVMValueRef>,
         call: LLVMValueRef,
     ) -> LLVMValueRef {
         unsafe {
@@ -985,13 +1239,17 @@ impl Pass {
             if scalar.is_some() {
                 constraints.push("{r1}");
             }
+            if mask.is_some() {
+                constraints.push("{r2}");
+            }
             if !op.kind.defines_scalar() {
                 constraints.push("~{r0}");
             }
             if op.is_memory() {
                 constraints.push("~{memory}");
             }
-            let args: Vec<LLVMValueRef> = scalar.into_iter().collect();
+            let args: Vec<LLVMValueRef> =
+                scalar.into_iter().chain(mask).collect();
             self.emit_asm(builder, &text, &constraints.join(","), ret, &args)
         }
     }
@@ -1111,6 +1369,38 @@ impl Pass {
             self.emit_asm(builder, &text, "r,~{r0}", void, &[cond]);
         }
     }
+}
+
+/// Per allocator instruction, how many run members it emits: 2 or more
+/// for the first member of consecutive registers (one `ldn` / `stn`), 0 for
+/// the others, 1 for everything else.
+fn fuse_runs(insts: &[Inst], reg: &[Option<Reg>]) -> Vec<u8> {
+    let run_reg = |inst: &Inst| {
+        let run = inst.run?;
+        let t = if run.store { (*inst.uses.first()?)? } else { inst.def? };
+        Some((run, reg[t as usize]?))
+    };
+    let mut fused = vec![1; insts.len()];
+    let mut i = 0;
+    while i < insts.len() {
+        let mut j = i + 1;
+        if let Some((first, base)) = run_reg(&insts[i]) {
+            while j < insts.len()
+                && run_reg(&insts[j]).is_some_and(|(run, r)| {
+                    let n = (j - i) as u8;
+                    run.id == first.id && run.k == first.k + n && r == base + n
+                })
+            {
+                j += 1;
+            }
+        }
+        if j - i >= 2 {
+            fused[i] = (j - i) as u8;
+            fused[i + 1..j].fill(0);
+        }
+        i = j;
+    }
+    fused
 }
 
 fn mov(dst: Reg, src: Reg) -> u64 {

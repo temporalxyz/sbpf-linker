@@ -23,6 +23,19 @@ declare i64 @__svm_hsum_d(i32)
 declare i64 @__svm_extract_q(i32, i32)
 declare i32 @__svm_insert_q(i32, i64, i32)
 declare i32 @__svm_clmul(i32, i32, i32)
+declare i32 @__svm_add_d_mask(i32, i32, i32, i64)
+declare i32 @__svm_add_d_maskz(i32, i32, i64)
+declare i32 @__svm_dpbusd_mask(i32, i32, i32, i64)
+declare i32 @__svm_blendm(i32, i32, i64, i32)
+declare i64 @__svm_cmp(i32, i32, i32)
+declare i64 @__svm_mpopcnt(i64)
+declare i32 @__svm_ld_m_maskz(ptr, i64, i32)
+declare void @__svm_st_m_mask(i32, ptr, i64, i32)
+declare i32 @__svm_gather_qq_mask(i32, i32, ptr, i64, i32)
+declare void @__svm_scatter_qq(i32, i32, ptr, i32)
+declare i32 @__svm_sha256rnds2(i32, i32, i32)
+declare i32 @__svm_ldn(ptr, i32, i32)
+declare void @__svm_stn(i32, ptr, i32, i32)
 declare void @sink(i32)
 "#;
 
@@ -59,7 +72,7 @@ fn decode(ir: &str) -> Vec<Word> {
         .skip(1)
         .map(|s| {
             let word = u64::from_str_radix(&s[..16], 16).unwrap();
-            assert_eq!(word & 0xffff, 0x2085, "CALL_IMM src=2");
+            assert_eq!(word & 0xf0ff, 0x2085, "CALL_IMM src=2");
             let imm = (word >> 32) as u32;
             assert_eq!(imm & 0x8000, 0);
             (
@@ -79,6 +92,14 @@ fn offsets(ir: &str) -> Vec<i16> {
         .skip(1)
         .map(|s| u64::from_str_radix(&s[..16], 16).unwrap() as u32 >> 16)
         .map(|off| off as u16 as i16)
+        .collect()
+}
+
+/// The mask mode (`dst`) of every emitted op, in order.
+fn modes(ir: &str) -> Vec<u8> {
+    ir.split(".quad 0x")
+        .skip(1)
+        .map(|s| (u64::from_str_radix(&s[..16], 16).unwrap() >> 8 & 0xf) as u8)
         .collect()
 }
 
@@ -702,4 +723,511 @@ define void @f(ptr %p) {
         e.contains("unknown vector intrinsic marker `__svm_frobnicate`"),
         "{e}"
     );
+}
+
+#[test]
+fn masked_ops_pass_the_mask_in_r2() {
+    let l = lower(
+        r#"
+define void @f(ptr %p, i64 %k) {
+  %a = call i32 @__svm_ld(ptr %p)
+  %b = call i32 @__svm_ld(ptr %p)
+  %c = call i32 @__svm_add_d_maskz(i32 %a, i32 %b, i64 %k)
+  %d = call i32 @__svm_add_d_mask(i32 %c, i32 %a, i32 %b, i64 %k)
+  %e = call i32 @__svm_dpbusd_mask(i32 %d, i32 %a, i32 %b, i64 %k)
+  call void @__svm_st(i32 %e, ptr %p)
+  ret void
+}
+"#,
+    )
+    .unwrap();
+    // mode 2 writes a new register, mode 1 merges into the source (tied)
+    assert_eq!(
+        l.words[2..5],
+        [(0x12, 0, 2, 0, 1), (0x12, 0, 2, 0, 1), (0x50, 0, 2, 0, 1)]
+    );
+    assert_eq!(modes(&l.ir), [0, 0, 2, 1, 1, 0]);
+    assert!(
+        l.ir.contains(r#".quad 0x1200080100002285", "{r2},~{r0}"(i64 %k)"#),
+        "{}",
+        l.ir
+    );
+}
+
+#[test]
+fn merge_source_live_after_is_copied() {
+    let l = lower(
+        r#"
+define void @f(ptr %p, i64 %k) {
+  %a = call i32 @__svm_ld(ptr %p)
+  %b = call i32 @__svm_ld(ptr %p)
+  %c = call i32 @__svm_add_d_mask(i32 %a, i32 %a, i32 %b, i64 %k)
+  call void @__svm_st(i32 %c, ptr %p)
+  call void @__svm_st(i32 %a, ptr %p)
+  ret void
+}
+"#,
+    )
+    .unwrap();
+    assert_eq!(l.words[2], (0x09, 0, 2, 0, 0));
+    assert_eq!(l.words[3], (0x12, 0, 2, 0, 1));
+}
+
+#[test]
+fn mask_data_and_scalar_results() {
+    let l = lower(
+        r#"
+define i64 @f(ptr %p, i64 %k) {
+  %a = call i32 @__svm_ld(ptr %p)
+  %b = call i32 @__svm_blendm(i32 %a, i32 %a, i64 %k, i32 2)
+  %m = call i64 @__svm_cmp(i32 %a, i32 %b, i32 37)
+  %n = call i64 @__svm_mpopcnt(i64 %m)
+  %c = call i32 @__svm_sha256rnds2(i32 %b, i32 %a, i32 %a)
+  call void @__svm_st(i32 %c, ptr %p)
+  ret i64 %n
+}
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        l.words,
+        [
+            (0x00, 0, 0, 0, 0),
+            (0x79, 2, 1, 0, 0),
+            (0x46, 37, 0, 0, 1),
+            (0xf6, 0, 0, 0, 0),
+            (0xe1, 0, 1, 0, 0),
+            (0x01, 0, 0, 1, 0)
+        ]
+    );
+    assert_eq!(modes(&l.ir), [0; 6]);
+    assert!(l.ir.contains(r#""{r2},~{r0}"(i64 %k)"#), "{}", l.ir);
+    assert!(
+        l.ir.contains(r#"= call i64 asm sideeffect ".quad 0x4625000100002085", "={r0}"()"#),
+        "{}",
+        l.ir
+    );
+    assert!(
+        l.ir.contains(r#"= call i64 asm sideeffect ".quad 0xf600000000002085", "={r0},{r2}"(i64 %1)"#),
+        "{}",
+        l.ir
+    );
+}
+
+#[test]
+fn masked_memory_gather_scatter() {
+    let l = lower(
+        r#"
+define void @f(ptr %p, i64 %k) {
+  %q = getelementptr inbounds i8, ptr %p, i64 128
+  %a = call i32 @__svm_ld_m_maskz(ptr %q, i64 %k, i32 3)
+  %b = call i32 @__svm_gather_qq_mask(i32 %a, i32 %a, ptr %p, i64 %k, i32 3)
+  call void @__svm_scatter_qq(i32 %a, i32 %b, ptr %q, i32 0)
+  call void @__svm_st_m_mask(i32 %b, ptr %p, i64 %k, i32 1)
+  ret void
+}
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        l.words,
+        [
+            (0x0a, 3, 0, 0, 0),
+            (0x09, 0, 1, 0, 0),
+            (0xe8, 3, 1, 0, 0),
+            (0xec, 0, 0, 0, 1),
+            (0x0b, 1, 0, 1, 0)
+        ]
+    );
+    assert_eq!(modes(&l.ir), [2, 0, 1, 0, 1]);
+    assert_eq!(offsets(&l.ir), [128, 0, 0, 128, 0]);
+    assert!(
+        l.ir.contains(r#""{r1},{r2},~{r0},~{memory}"(ptr %p, i64 %k)"#),
+        "{}",
+        l.ir
+    );
+}
+
+#[test]
+fn narrow_and_broadcast_memory_dword_gather_scatter() {
+    let l = lower(
+        r#"
+declare i32 @__svm_ld_x(ptr)
+declare void @__svm_st_y(i32, ptr)
+declare i32 @__svm_ldbc_x_maskz(ptr, i64)
+declare i32 @__svm_gather_dd(i32, ptr, i32)
+declare void @__svm_scatter_qd_mask(i32, i32, ptr, i64, i32)
+
+define void @f(ptr %p, i64 %k) {
+  %q = getelementptr inbounds i8, ptr %p, i64 16
+  %a = call i32 @__svm_ld_x(ptr %q)
+  %b = call i32 @__svm_ldbc_x_maskz(ptr %p, i64 %k)
+  %c = call i32 @__svm_gather_dd(i32 %a, ptr %p, i32 2)
+  call void @__svm_st_y(i32 %c, ptr %q)
+  call void @__svm_scatter_qd_mask(i32 %a, i32 %b, ptr %q, i64 %k, i32 1)
+  ret void
+}
+"#,
+    )
+    .unwrap();
+    assert_eq!(ops(&l.words), [0xf0, 0xf4, 0xe9, 0x0f, 0xef]);
+    assert_eq!(modes(&l.ir), [0, 2, 0, 0, 1]);
+    assert_eq!(offsets(&l.ir), [16, 0, 0, 16, 16]);
+    assert_eq!(l.ir.matches("~{memory}").count(), 5, "{}", l.ir);
+}
+
+#[test]
+fn error_masked_marker_arguments() {
+    let e = error(
+        r#"
+define void @f(ptr %p, i64 %k) {
+  %a = call i32 @__svm_ld(ptr %p)
+  %b = call i32 @__svm_add_d_mask(i32 %a, i32 %a, i64 %k)
+  ret void
+}
+"#,
+    );
+    assert!(
+        e.contains(
+            "`__svm_add_d_mask` takes 4 arguments, but is called with 3"
+        ),
+        "{e}"
+    );
+    // modes the op does not have
+    let e = error(
+        r#"
+declare i32 @__svm_zero_mask(i32, i64)
+declare i32 @__svm_ld_m(ptr, i32)
+define void @f(ptr %p, i64 %k) {
+  %a = call i32 @__svm_ld(ptr %p)
+  %c = call i32 @__svm_zero_mask(i32 %a, i64 %k)
+  %d = call i32 @__svm_ld_m(ptr %p, i32 0)
+  ret void
+}
+"#,
+    );
+    assert!(
+        e.contains("`__svm_zero_mask`: `zero` has no such mask mode"),
+        "{e}"
+    );
+    assert!(e.contains("`__svm_ld_m`: `ld.m` has no such mask mode"), "{e}");
+}
+
+/// `n` loads from `%p` at offsets 64 apart, then their sum stored.
+fn load_run(n: usize, between: &str) -> String {
+    let mut body = String::from("define void @f(ptr %p, ptr %q) {\n");
+    for k in 0..n {
+        body += &format!(
+            "  %p{k} = getelementptr inbounds i8, ptr %p, i64 {}\n  %v{k} = call i32 @__svm_ld(ptr %p{k})\n{}",
+            64 * k,
+            between.replace('#', &k.to_string())
+        );
+    }
+    body += "  %s0 = call i32 @__svm_add_d(i32 %v0, i32 %v0)\n";
+    for k in 1..n {
+        body += &format!(
+            "  %s{k} = call i32 @__svm_add_d(i32 %s{}, i32 %v{k})\n",
+            k - 1
+        );
+    }
+    body += &format!(
+        "  call void @__svm_st(i32 %s{}, ptr %q)\n  ret void\n}}\n",
+        n - 1
+    );
+    body
+}
+
+#[test]
+fn load_runs_fuse_to_ldn() {
+    let l = lower(&load_run(4, "")).unwrap();
+    assert_eq!(l.words[0], (0x0c, 4, 0, 0, 0));
+    assert_eq!(ops(&l.words)[1..5], [0x12; 4]);
+    assert_eq!(l.ir.matches("(ptr %p)").count(), 1, "{}", l.ir);
+
+    // a store in between could change what the later loads read
+    let between = "  store i8 0, ptr %q\n";
+    let l = lower(&load_run(4, between)).unwrap();
+    assert_eq!(ops(&l.words)[..4], [0x00; 4]);
+    assert_eq!(offsets(&l.ir)[..4], [0, 64, 128, 192]);
+
+    // scalar arithmetic in between is fine
+    let l = lower(&load_run(3, "  %x# = add i64 0, 1\n")).unwrap();
+    assert_eq!(l.words[0], (0x0c, 3, 0, 0, 0));
+
+    // the 30 registers are enough for one ldn
+    let l = lower(&load_run(30, "")).unwrap();
+    assert_eq!(l.words[0], (0x0c, 30, 0, 0, 0));
+}
+
+#[test]
+fn load_runs_need_one_object() {
+    // without inbounds the addresses may lie in different regions
+    let l = lower(
+        r#"
+define void @f(ptr %p) {
+  %q = getelementptr i8, ptr %p, i64 64
+  %a = call i32 @__svm_ld(ptr %p)
+  %b = call i32 @__svm_ld(ptr %q)
+  %c = call i32 @__svm_add_d(i32 %a, i32 %b)
+  call void @__svm_st(i32 %c, ptr %p)
+  ret void
+}
+"#,
+    )
+    .unwrap();
+    assert_eq!(ops(&l.words), [0x00, 0x00, 0x12, 0x01]);
+}
+
+#[test]
+fn store_runs_fuse_to_stn() {
+    let l = lower(
+        r#"
+define void @f(ptr %p, ptr %q) {
+  %a = call i32 @__svm_ld(ptr %q)
+  %b = call i32 @__svm_add_d(i32 %a, i32 %a)
+  %c = call i32 @__svm_add_d(i32 %b, i32 %a)
+  %d = call i32 @__svm_add_d(i32 %c, i32 %b)
+  %p1 = getelementptr inbounds i8, ptr %p, i64 64
+  %p2 = getelementptr inbounds i8, ptr %p, i64 128
+  %p3 = getelementptr inbounds i8, ptr %p, i64 192
+  call void @__svm_st(i32 %a, ptr %p1)
+  call void @__svm_st(i32 %b, ptr %p2)
+  call void @__svm_st(i32 %c, ptr %p3)
+  ret void
+}
+"#,
+    )
+    .unwrap();
+    let stn = l.words.iter().find(|w| w.0 == 0x0d).copied();
+    assert_eq!(stn.map(|w| w.1), Some(3), "{:?}", l.words);
+    assert_eq!(*offsets(&l.ir).last().unwrap(), 64);
+}
+
+#[test]
+fn explicit_ldn_stn() {
+    let l = lower(
+        r#"
+define void @f(ptr %p, ptr %q) {
+  %a = call i32 @__svm_ldn(ptr %p, i32 0, i32 3)
+  %b = call i32 @__svm_ldn(ptr %p, i32 1, i32 3)
+  %c = call i32 @__svm_ldn(ptr %p, i32 2, i32 3)
+  %x = call i32 @__svm_add_d(i32 %a, i32 %b)
+  %y = call i32 @__svm_add_d(i32 %b, i32 %c)
+  call void @__svm_stn(i32 %x, ptr %q, i32 0, i32 2)
+  call void @__svm_stn(i32 %y, ptr %q, i32 1, i32 2)
+  ret void
+}
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        l.words,
+        [
+            (0x0c, 3, 0, 0, 0),
+            (0x12, 0, 0, 0, 1),
+            (0x12, 0, 1, 1, 2),
+            (0x0d, 2, 0, 0, 0)
+        ]
+    );
+
+    // registers that cannot be consecutive: single loads at p + 64k
+    let l = lower(
+        r#"
+define void @f(ptr %p) {
+  %a = call i32 @__svm_ldn(ptr %p, i32 0, i32 2)
+  call void @__svm_st(i32 %a, ptr %p)
+  %b = call i32 @__svm_ldn(ptr %p, i32 1, i32 2)
+  call void @__svm_st(i32 %b, ptr %p)
+  ret void
+}
+"#,
+    )
+    .unwrap();
+    assert_eq!(ops(&l.words), [0x00, 0x01, 0x00, 0x01]);
+    assert_eq!(offsets(&l.ir), [0, 0, 64, 0]);
+}
+
+#[test]
+fn error_ldn_counts() {
+    let e = error(
+        r#"
+define void @f(ptr %p) {
+  %a = call i32 @__svm_ldn(ptr %p, i32 0, i32 31)
+  %b = call i32 @__svm_ldn(ptr %p, i32 2, i32 2)
+  ret void
+}
+"#,
+    );
+    assert!(e.contains("immediate 0 of 31 is out of range for `ldn`"), "{e}");
+    assert!(e.contains("immediate 2 of 2 is out of range for `ldn`"), "{e}");
+}
+
+#[test]
+fn two_table_permute_ties_the_dying_operand() {
+    let decls = r#"
+declare i32 @__svm_perm2t(i32, i32, i32, i32)
+declare i32 @__svm_perm2t_mask(i32, i32, i32, i64, i32)
+declare i32 @__svm_perm2_w_maskz(i32, i32, i32, i64)
+declare i32 @__svm_perm2i_mask(i32, i32, i32, i64, i32)
+"#;
+    // the table stays live, the index dies: perm2i with out = index
+    let l = lower(&format!(
+        r#"{decls}
+define void @f(ptr %p) {{
+  %t = call i32 @__svm_ld(ptr %p)
+  %i = call i32 @__svm_ld(ptr %p)
+  %u = call i32 @__svm_ld(ptr %p)
+  %r = call i32 @__svm_perm2t(i32 %t, i32 %i, i32 %u, i32 3)
+  call void @__svm_st(i32 %r, ptr %p)
+  call void @__svm_st(i32 %t, ptr %p)
+  ret void
+}}
+"#
+    ))
+    .unwrap();
+    let (t, i, u) = (l.words[0].2, l.words[1].2, l.words[2].2);
+    assert_eq!(l.words[3], (0x5f, 3, i, t, u));
+    // the index stays live: perm2t with out = table
+    let l = lower(&format!(
+        r#"{decls}
+define void @f(ptr %p) {{
+  %t = call i32 @__svm_ld(ptr %p)
+  %i = call i32 @__svm_ld(ptr %p)
+  %u = call i32 @__svm_ld(ptr %p)
+  %r = call i32 @__svm_perm2t(i32 %t, i32 %i, i32 %u, i32 2)
+  call void @__svm_st(i32 %r, ptr %p)
+  call void @__svm_st(i32 %i, ptr %p)
+  ret void
+}}
+"#
+    ))
+    .unwrap();
+    let (t, i, u) = (l.words[0].2, l.words[1].2, l.words[2].2);
+    assert_eq!(l.words[3], (0x85, 2, t, i, u));
+    // zero masking may switch (perm2.w becomes perm2i w), merge keeps its source
+    let l = lower(&format!(
+        r#"{decls}
+define void @f(ptr %p, i64 %k) {{
+  %t = call i32 @__svm_ld(ptr %p)
+  %i = call i32 @__svm_ld(ptr %p)
+  %u = call i32 @__svm_ld(ptr %p)
+  %r = call i32 @__svm_perm2_w_maskz(i32 %t, i32 %i, i32 %u, i64 %k)
+  %s = call i32 @__svm_perm2t_mask(i32 %t, i32 %r, i32 %u, i64 %k, i32 0)
+  %v = call i32 @__svm_perm2i_mask(i32 %s, i32 %t, i32 %u, i64 %k, i32 1)
+  call void @__svm_st(i32 %v, ptr %p)
+  call void @__svm_st(i32 %t, ptr %p)
+  ret void
+}}
+"#
+    ))
+    .unwrap();
+    let (t, u) = (l.words[0].2, l.words[2].2);
+    assert_eq!(ops(&l.words)[3..], [0x5f, 0x09, 0x85, 0x5f, 0x01, 0x01]);
+    assert_eq!(l.words[3].1, 1);
+    assert_eq!((l.words[3].3, l.words[3].4), (t, u));
+    assert_eq!(modes(&l.ir)[3..7], [2, 0, 1, 1]);
+    assert_eq!(l.words[6], (0x5f, 1, l.words[5].2, t, u));
+}
+
+#[test]
+fn data_movement_markers() {
+    let l = lower(
+        r#"
+declare i32 @__svm_compress_maskz(i32, i64, i32)
+declare i32 @__svm_bcast_w_mask(i32, i32, i64, i32)
+declare i64 @__svm_extract_b(i32, i32)
+declare i32 @__svm_insert_w(i32, i64, i32)
+declare i32 @__svm_movr_q(i64)
+declare i32 @__svm_narrow_q_b(i32)
+define i64 @f(ptr %p, i64 %x, i64 %k) {
+  %a = call i32 @__svm_ld(ptr %p)
+  %b = call i32 @__svm_compress_maskz(i32 %a, i64 %k, i32 2)
+  %c = call i32 @__svm_bcast_w_mask(i32 %a, i32 %b, i64 %k, i32 9)
+  %d = call i32 @__svm_insert_w(i32 %c, i64 %x, i32 31)
+  %e = call i32 @__svm_movr_q(i64 %x)
+  %f = call i32 @__svm_narrow_q_b(i32 %e)
+  call void @__svm_st(i32 %d, ptr %p)
+  call void @__svm_st(i32 %f, ptr %p)
+  %r = call i64 @__svm_extract_b(i32 %a, i32 63)
+  ret i64 %r
+}
+"#,
+    )
+    .unwrap();
+    let ops = ops(&l.words);
+    for op in [0x92, 0x7c, 0xac, 0xae, 0x97, 0xa9] {
+        assert!(ops.contains(&op), "{op:#x} {:?}", l.words);
+    }
+    let modes = modes(&l.ir);
+    let mode = |op| modes[ops.iter().position(|o| *o == op).unwrap()];
+    assert_eq!((mode(0x92), mode(0x7c), mode(0xac)), (2, 1, 0));
+    let insert = l.words[ops.iter().position(|o| *o == 0xac).unwrap()];
+    assert_eq!(insert.1, 31);
+    assert!(l.ir.contains(r#""{r1},~{r0}"(i64 %x)"#), "{}", l.ir);
+}
+
+#[test]
+fn arithmetic_masks_and_saturating_accumulators() {
+    let l = lower(
+        r#"
+declare i32 @__svm_mul52lo_maskz(i32, i32, i64)
+declare i32 @__svm_abs_q_mask(i32, i32, i64)
+declare i32 @__svm_dpbusds_mask(i32, i32, i32, i64)
+declare i32 @__svm_sad(i32, i32)
+define void @f(ptr %p, i64 %k) {
+  %a = call i32 @__svm_ld(ptr %p)
+  %b = call i32 @__svm_ld(ptr %p)
+  %c = call i32 @__svm_mul52lo_maskz(i32 %a, i32 %b, i64 %k)
+  %d = call i32 @__svm_abs_q_mask(i32 %c, i32 %a, i64 %k)
+  %e = call i32 @__svm_dpbusds_mask(i32 %d, i32 %a, i32 %b, i64 %k)
+  %f = call i32 @__svm_sad(i32 %e, i32 %b)
+  call void @__svm_st(i32 %f, ptr %p)
+  ret void
+}
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        l.words[2..6],
+        [
+            (0xaf, 0, 2, 0, 1),
+            (0xb1, 0, 2, 0, 0),
+            (0x56, 0, 2, 0, 1),
+            (0xc5, 0, 0, 2, 1)
+        ]
+    );
+    assert_eq!(modes(&l.ir), [0, 0, 2, 1, 1, 0, 0]);
+}
+
+#[test]
+fn crypto_ops() {
+    let l = lower(
+        r#"
+declare i32 @__svm_gf2p8affine_mask(i32, i32, i32, i64, i32)
+declare i32 @__svm_aesenc(i32, i32)
+declare i32 @__svm_sha1msg2(i32, i32)
+define void @f(ptr %p, i64 %k) {
+  %a = call i32 @__svm_ld(ptr %p)
+  %b = call i32 @__svm_gf2p8affine_mask(i32 %a, i32 %a, i32 %a, i64 %k, i32 99)
+  %c = call i32 @__svm_aesenc(i32 %b, i32 %a)
+  %d = call i32 @__svm_sha1msg2(i32 %c, i32 %b)
+  call void @__svm_st(i32 %d, ptr %p)
+  ret void
+}
+"#,
+    )
+    .unwrap();
+    // The merge source is copied, sha1msg2 reads and writes the dying %c
+    assert_eq!(
+        l.words,
+        [
+            (0x00, 0, 0, 0, 0),
+            (0x09, 0, 1, 0, 0),
+            (0xdb, 99, 1, 0, 0),
+            (0xdd, 0, 0, 1, 0),
+            (0xe7, 0, 0, 1, 0),
+            (0x01, 0, 0, 0, 0)
+        ]
+    );
+    assert_eq!(modes(&l.ir), [0, 0, 1, 0, 0, 0]);
 }
