@@ -866,19 +866,16 @@ impl Pass {
                 offset: i64::from(imms[0]) * 64,
                 count: imms[1],
             }),
-            // Only loads (stores) from one allocated object: fused, they
-            // need the whole span in one region.
             _ if mode == 0 && (op.code == LD || op.code == ST) => {
-                let (base, offset) = unsafe { self.inbounds_offset(address)? };
+                let (base, offset) = unsafe { self.gep_offset(address)? };
                 Some(RunKey { store: op.code == ST, base, offset, count: 0 })
             }
             _ => None,
         }
     }
 
-    /// `address` as `base + offset` through inbounds GEPs with constant
-    /// indices.
-    unsafe fn inbounds_offset(
+    /// `address` as `base + offset` through GEPs with constant indices.
+    unsafe fn gep_offset(
         &self,
         mut address: LLVMValueRef,
     ) -> Option<(LLVMValueRef, i64)> {
@@ -892,9 +889,7 @@ impl Pass {
                 } else {
                     break;
                 };
-                if opcode != LLVMOpcode::LLVMGetElementPtr
-                    || LLVMIsInBounds(address) == 0
-                {
+                if opcode != LLVMOpcode::LLVMGetElementPtr {
                     break;
                 }
                 let Some((base, step)) = self.constant_step(address) else {
