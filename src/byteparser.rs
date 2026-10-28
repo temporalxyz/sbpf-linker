@@ -42,14 +42,16 @@ fn decode_instruction_for_arch(
 /// Vector ops are `call` with `src = 2` (see `crate::vector`). They are kept
 /// verbatim: neither syscalls nor internal calls, and never relocated.
 fn decode_vector_op(data: &[u8]) -> Option<Instruction> {
-    let [0x85, 0x20, off @ .., i0, i1, i2, i3] = *data.first_chunk::<8>()?
+    let [0x85, regs @ 0x20..=0x2f, off @ .., i0, i1, i2, i3] =
+        *data.first_chunk::<8>()?
     else {
         return None;
     };
     let imm = [i0, i1, i2, i3];
     Some(Instruction {
         opcode: Opcode::Call,
-        dst: None,
+        // the mask mode
+        dst: Some(Register { n: regs & 0xf }),
         src: Some(Register { n: 2 }),
         // memory ops address `r1 + off`
         off: Some(Either::Right(i16::from_le_bytes(off))),
@@ -58,7 +60,8 @@ fn decode_vector_op(data: &[u8]) -> Option<Instruction> {
     })
 }
 
-/// Marks a vector op whose `off` is parked in its span (see below).
+/// Marks a vector op whose `dst` and `off` are parked in its span (see
+/// below).
 const VECTOR_OFF_SPAN_END: usize = usize::MAX;
 
 fn is_vector_op(instruction: &Instruction) -> bool {
@@ -66,16 +69,19 @@ fn is_vector_op(instruction: &Instruction) -> bool {
         && instruction.src.as_ref().is_some_and(|src| src.n == 2)
 }
 
-/// The assembler's validation rejects a `call` with an `off`, but vector
-/// memory ops use it. Park it in the span (only used for diagnostics) while
-/// the program is built, and put it back afterwards.
+/// The assembler's validation rejects a `call` with a `dst` or an `off`, but
+/// vector ops use them (mask mode, memory displacement). Park them in the
+/// span (only used for diagnostics) while the program is built, and put
+/// them back afterwards.
 fn hide_vector_offsets(nodes: &mut [ASTNode]) {
     for node in nodes {
         if let ASTNode::Instruction { instruction, .. } = node
             && is_vector_op(instruction)
             && let Some(Either::Right(off)) = instruction.off.take()
         {
-            instruction.span = off as u16 as usize..VECTOR_OFF_SPAN_END;
+            let mode = instruction.dst.take().map_or(0, |dst| dst.n);
+            instruction.span = (off as u16 as usize | usize::from(mode) << 16)
+                ..VECTOR_OFF_SPAN_END;
         }
     }
 }
@@ -90,6 +96,8 @@ fn restore_vector_offsets(layout: &mut ProgramLayout) {
         {
             let off = instruction.span.start as u16 as i16;
             instruction.off = Some(Either::Right(off));
+            let mode = (instruction.span.start >> 16) as u8;
+            instruction.dst = (mode != 0).then_some(Register { n: mode });
             instruction.span = 0..8;
         }
     }

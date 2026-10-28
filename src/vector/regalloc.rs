@@ -65,6 +65,18 @@ pub struct Inst {
     /// Caller-defined position: spills and reloads take the origin of the
     /// instruction they are inserted before.
     pub origin: usize,
+    /// Set if the op is one of a run of loads (stores) that becomes one
+    /// `ldn` (`stn`) where the registers turn out consecutive.
+    pub run: Option<Run>,
+}
+
+/// Member `k` of run `id`. A load run's defs, or a store run's `uses[0]`,
+/// are given ascending consecutive registers where possible.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Run {
+    pub id: u32,
+    pub k: u8,
+    pub store: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -329,6 +341,7 @@ fn spill(func: &mut Func) -> Result<u32, AllocError> {
             def: Some(r),
             uses: Vec::new(),
             origin: block.insts[j].origin,
+            run: None,
         };
         block.insts.insert(j, reload);
         if slot_of.insert(v, slot).is_none() {
@@ -337,6 +350,7 @@ fn spill(func: &mut Func) -> Result<u32, AllocError> {
                 def: None,
                 uses: vec![Some(v)],
                 origin: block.insts[i].origin,
+                run: None,
             };
             block.insts.insert(i, store);
         }
@@ -380,12 +394,40 @@ pub fn allocate(func: &mut Func) -> Result<Allocation, AllocError> {
         }
     }
 
+    // Store runs: the value of each member, and the members of each value.
+    let mut stored: HashMap<(u32, u8), Tok> = HashMap::new();
+    let mut stores_of: HashMap<Tok, Vec<(u32, u8)>> = HashMap::new();
+    for block in &func.blocks {
+        for inst in &block.insts {
+            if let (Some(run), Some(&Some(t))) = (inst.run, inst.uses.first())
+                && run.store
+            {
+                stored.insert((run.id, run.k), t);
+                stores_of.entry(t).or_default().push((run.id, run.k));
+            }
+        }
+    }
+
     let mut reg: Vec<Option<Reg>> = vec![None; n];
     let mut pre_copy: Vec<Vec<Option<(Reg, Reg)>>> =
         func.blocks.iter().map(|b| vec![None; b.insts.len()]).collect();
     let mut written: RegSet = 0;
     let prefs = |reg: &[Option<Reg>], t: Tok| -> Vec<Reg> {
-        affinity[t as usize].iter().filter_map(|&a| reg[a as usize]).collect()
+        // Next to the values stored before and after it in a store run.
+        let neighbours =
+            stores_of.get(&t).into_iter().flatten().flat_map(|&(id, k)| {
+                let at = |k: Option<u8>, step: i8| {
+                    let r = reg[*stored.get(&(id, k?))? as usize]?;
+                    r.checked_add_signed(step).filter(|&r| r < NUM_REGS)
+                };
+                [at(k.checked_sub(1), 1), at(k.checked_add(1), -1)]
+            });
+        neighbours
+            .flatten()
+            .chain(
+                affinity[t as usize].iter().filter_map(|&a| reg[a as usize]),
+            )
+            .collect()
     };
     let regs_of = |reg: &[Option<Reg>], live: &Bits| -> RegSet {
         live.iter().filter_map(|t| reg[t as usize]).fold(0, |s, r| s | bit(r))
@@ -450,7 +492,11 @@ pub fn allocate(func: &mut Func) -> Result<Allocation, AllocError> {
                         .map(|&u| reg[u as usize].unwrap());
                     pick(free, ops.chain(prefs(&reg, d))).ok_or_else(err)?
                 }
-                _ => pick(free, prefs(&reg, d)).ok_or_else(err)?,
+                _ => {
+                    let run = load_run(func, &reg, &forbidden, b, i, free);
+                    pick(free, run.into_iter().chain(prefs(&reg, d)))
+                        .ok_or_else(err)?
+                }
             };
             reg[d as usize] = Some(r);
             written |= bit(r);
@@ -495,6 +541,41 @@ pub fn allocate(func: &mut Func) -> Result<Allocation, AllocError> {
     let alloc = Allocation { reg, pre_copy, edge_moves, written, slots };
     verify(func, &rpo, &alloc);
     Ok(alloc)
+}
+
+/// The preferred register of the def of load run member `i` of block `b`:
+/// one above the previous member, or, for the first member of a sequence,
+/// the lowest register that starts a window free for the whole sequence.
+fn load_run(
+    func: &Func,
+    reg: &[Option<Reg>],
+    forbidden: &[RegSet],
+    b: usize,
+    i: usize,
+    free: RegSet,
+) -> Option<Reg> {
+    let insts = &func.blocks[b].insts;
+    insts[i].run.filter(|r| !r.store)?;
+    let follows = |prev: &Inst, next: &Inst| {
+        matches!((prev.run, next.run), (Some(p), Some(n))
+            if p.id == n.id && p.k + 1 == n.k && prev.def.is_some())
+    };
+    if i > 0 && follows(&insts[i - 1], &insts[i]) {
+        return reg[insts[i - 1].def? as usize].map(|r| r + 1);
+    }
+    let mut defs = vec![insts[i].def?];
+    for pair in insts[i..].windows(2) {
+        match pair[1].def {
+            Some(d) if follows(&pair[0], &pair[1]) => defs.push(d),
+            _ => break,
+        }
+    }
+    (0..=NUM_REGS.checked_sub(defs.len() as u8)?).find(|&r| {
+        defs.iter().enumerate().all(|(j, &t)| {
+            let r = r + j as u8;
+            free & bit(r) != 0 && forbidden[t as usize] & bit(r) == 0
+        })
+    })
 }
 
 /// Orders a parallel copy `dst ← src` (distinct destinations) into moves,
@@ -631,6 +712,7 @@ mod tests {
             def,
             uses: uses.to_vec(),
             origin: 0,
+            run: None,
         }
     }
     fn acc(def: Tok, uses: &[Option<Tok>]) -> Inst {
@@ -639,6 +721,7 @@ mod tests {
             def: Some(def),
             uses: uses.to_vec(),
             origin: 0,
+            run: None,
         }
     }
     fn call(clobbers: RegSet) -> Inst {
@@ -647,6 +730,7 @@ mod tests {
             def: None,
             uses: vec![],
             origin: 0,
+            run: None,
         }
     }
     fn block(succs: &[usize], phis: Vec<Phi>, insts: Vec<Inst>) -> Block {
@@ -866,6 +950,51 @@ mod tests {
             allocate(&mut f).err(),
             Some(AllocError::ClobberedByCalls { block: 0, inst: Some(0) })
         );
+    }
+
+    fn member(mut inst: Inst, id: u32, k: u8, store: bool) -> Inst {
+        inst.run = Some(Run { id, k, store });
+        inst
+    }
+
+    #[test]
+    fn load_runs_get_a_free_window() {
+        // t0, t1, t2 = ld; use t1; t3, t4, t5 = run of loads; use all
+        let mut insts = vec![
+            op(Some(0), &[]),
+            op(Some(1), &[]),
+            op(Some(2), &[]),
+            op(None, &[Some(1)]),
+        ];
+        insts.extend(
+            (0..3).map(|k| member(op(Some(3 + k), &[]), 0, k as u8, false)),
+        );
+        insts.push(op(None, &[0, 2, 3, 4, 5].map(Some)));
+        let mut f =
+            Func { blocks: vec![block(&[], vec![], insts)], num_tokens: 6 };
+        let a = allocate(&mut f).unwrap();
+        // v1 is free but too small a hole
+        assert_eq!(a.reg[3..], [Some(3), Some(4), Some(5)]);
+    }
+
+    #[test]
+    fn store_runs_prefer_consecutive_values() {
+        // t0, t1, t2 = ld; t3 = op t2; use t0; t4 = op t1; store run t3, t4
+        let insts = vec![
+            op(Some(0), &[]),
+            op(Some(1), &[]),
+            op(Some(2), &[]),
+            op(Some(3), &[Some(2)]),
+            op(None, &[Some(0)]),
+            op(Some(4), &[Some(1)]),
+            member(op(None, &[Some(3)]), 0, 0, true),
+            member(op(None, &[Some(4)]), 0, 1, true),
+        ];
+        let mut f =
+            Func { blocks: vec![block(&[], vec![], insts)], num_tokens: 5 };
+        let a = allocate(&mut f).unwrap();
+        // v0 and v1 are free at t4, but v3 follows t3
+        assert_eq!(a.reg[3..], [Some(2), Some(3)]);
     }
 
     #[test]

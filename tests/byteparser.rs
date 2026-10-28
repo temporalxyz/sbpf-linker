@@ -142,12 +142,16 @@ fn rodata_relocation_handles_interior_text_target() {
 
 #[test]
 fn vector_ops_pass_through_verbatim() {
-    // `ld v3, [r1 - 0x40]`, `hsum.d r0, v3` and `add.d v1, v2, v3`: CALL_IMM
-    // with src = 2, which is neither a syscall nor an internal call.
-    let words: [[u8; 8]; 3] = [
+    // `ld v3, [r1 - 0x40]`, `hsum.d r0, v3`, `add.d v1, v2, v3`, the masked
+    // `add.d v1{r2}{z}, v2, v3` and `ld.m.d v3{r2}, [r1 + 0x80]`: CALL_IMM
+    // with src = 2, which is neither a syscall nor an internal call. `dst`
+    // is the mask mode.
+    let words: [[u8; 8]; 5] = [
         [0x85, 0x20, 0xc0, 0xff, 0x00, 0x0c, 0x00, 0x00],
         [0x85, 0x20, 0, 0, 0x60, 0x00, 0x00, 0x70],
         [0x85, 0x20, 0, 0, 0x43, 0x04, 0x00, 0x12],
+        [0x85, 0x22, 0, 0, 0x43, 0x04, 0x00, 0x12],
+        [0x85, 0x21, 0x80, 0x00, 0x00, 0x0c, 0x02, 0x0a],
     ];
     let mut text_bytes = words.concat();
     text_bytes.extend_from_slice(&EXIT_INSTRUCTION);
