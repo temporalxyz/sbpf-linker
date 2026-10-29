@@ -493,6 +493,55 @@ define void @f(ptr %p) {
 }
 
 #[test]
+fn values_live_across_memory_intrinsics_avoid_libcall_registers() {
+    // Codegen lowers the intrinsics to calls to the program's `memcpy` and
+    // `memset`, which use v0.
+    let l = lower(
+        r#"
+declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)
+declare void @llvm.memset.p0.i64(ptr, i8, i64, i1)
+
+define ptr @memcpy(ptr %d, ptr %s, i64 %n) {
+  %a = call i32 @__svm_ld(ptr %s)
+  call void @__svm_st(i32 %a, ptr %d)
+  ret ptr %d
+}
+
+define ptr @memset(ptr %d, i32 %c, i64 %n) {
+  %a = call i32 @__svm_zero()
+  call void @__svm_st(i32 %a, ptr %d)
+  ret ptr %d
+}
+
+define internal void @clear(ptr %p, i64 %n) noinline {
+  call void @llvm.memset.p0.i64(ptr %p, i8 0, i64 %n, i1 false)
+  ret void
+}
+
+define void @f(ptr %p, i64 %n) {
+  %x = call i32 @__svm_ld(ptr %p)
+  call void @llvm.memcpy.p0.p0.i64(ptr %p, ptr %p, i64 %n, i1 false)
+  call void @__svm_st(i32 %x, ptr %p)
+  %y = call i32 @__svm_ld(ptr %p)
+  call void @clear(ptr %p, i64 %n)
+  call void @__svm_st(i32 %y, ptr %p)
+  ret void
+}
+"#,
+    )
+    .unwrap();
+    assert_eq!(l.words[..4].iter().map(|w| w.2).collect::<Vec<_>>(), [0; 4]);
+    assert_eq!(l.words[4], (0x00, 0, 1, 0, 0));
+    assert_eq!(l.words[5], (0x01, 0, 0, 1, 0));
+    assert_eq!(l.words[6], (0x00, 0, 1, 0, 0));
+    assert_eq!(l.words[7], (0x01, 0, 0, 1, 0));
+    // Later optimization must not add calls to them.
+    assert!(l.ir.contains(r#""no-builtin-memcpy""#), "{}", l.ir);
+    assert!(l.ir.contains(r#""no-builtin-memset""#), "{}", l.ir);
+    assert!(!l.ir.contains("no-builtin-memmove"), "{}", l.ir);
+}
+
+#[test]
 fn thirty_live_values_fit() {
     let mut body = String::from("define void @f(ptr %p) {\n");
     for i in 0..30 {

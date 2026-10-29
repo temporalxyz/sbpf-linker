@@ -16,7 +16,7 @@ use std::{
 };
 
 use bpf_linker::llvm_sys::{
-    LLVMInlineAsmDialect, LLVMOpcode,
+    LLVMAttributeFunctionIndex, LLVMInlineAsmDialect, LLVMOpcode,
     analysis::{LLVMVerifierFailureAction, LLVMVerifyModule},
     bit_reader::LLVMParseBitcodeInContext2,
     bit_writer::LLVMWriteBitcodeToMemoryBuffer,
@@ -471,6 +471,7 @@ impl Pass {
                 clobbers.insert(f, clobbered);
             }
             self.check()?;
+            self.keep_libcalls_out(&defined, &clobbers);
 
             let builder = LLVMCreateBuilderInContext(self.context);
             for (f, function, allocation) in &allocations {
@@ -570,11 +571,8 @@ impl Pass {
                         if op.kind.defines_vector() {
                             new_token(inst, &mut tokens);
                         }
-                    } else if !LLVMIsAInlineAsm(callee).is_null() {
-                    } else if LLVMIsAFunction(callee).is_null() {
-                        calls.push(Callee::Unknown);
-                    } else if LLVMIsDeclaration(callee) == 0 {
-                        calls.push(Callee::Defined(callee));
+                    } else if let Some(callee) = self.callee(callee) {
+                        calls.push(callee);
                     }
                 }
             }
@@ -725,15 +723,7 @@ impl Pass {
                             });
                             barrier = false;
                         }
-                    } else if LLVMIsAInlineAsm(callee).is_null()
-                        && (LLVMIsAFunction(callee).is_null()
-                            || LLVMIsDeclaration(callee) == 0)
-                    {
-                        let site = if LLVMIsAFunction(callee).is_null() {
-                            Callee::Unknown
-                        } else {
-                            Callee::Defined(callee)
-                        };
+                    } else if let Some(site) = self.callee(callee) {
                         block.insts.push(Inst {
                             kind: InstKind::Call { clobbers: ALL_REGS },
                             def: None,
@@ -753,6 +743,72 @@ impl Pass {
                 sites.push(block_sites);
             }
             (Some(Function { func, sites, blocks: bbs, tokens, preds }), calls)
+        }
+    }
+
+    /// What a call to `callee` (not a marker) may run, or `None` for inline
+    /// asm and functions outside the module. A memory intrinsic runs the
+    /// module's `memcpy`, `memmove` or `memset` when codegen lowers it to a
+    /// libcall.
+    unsafe fn callee(&self, callee: LLVMValueRef) -> Option<Callee> {
+        unsafe {
+            if !LLVMIsAInlineAsm(callee).is_null() {
+                return None;
+            }
+            if LLVMIsAFunction(callee).is_null() {
+                return Some(Callee::Unknown);
+            }
+            if LLVMIsDeclaration(callee) == 0 {
+                return Some(Callee::Defined(callee));
+            }
+            let name = value_name(callee);
+            let (libcall, _) = [
+                (c"memcpy", "llvm.memcpy."),
+                (c"memmove", "llvm.memmove."),
+                (c"memset", "llvm.memset."),
+            ]
+            .into_iter()
+            .find(|(_, prefix)| {
+                name.strip_prefix(prefix)
+                    .is_some_and(|rest| !rest.starts_with("inline."))
+            })?;
+            let f = LLVMGetNamedFunction(self.module, libcall.as_ptr());
+            (!f.is_null() && LLVMIsDeclaration(f) == 0)
+                .then_some(Callee::Defined(f))
+        }
+    }
+
+    /// Keeps the optimization run after this pass from adding calls to a
+    /// libcall the program defines with vector code: the allocation does
+    /// not account for them.
+    unsafe fn keep_libcalls_out(
+        &self,
+        defined: &[LLVMValueRef],
+        clobbers: &HashMap<LLVMValueRef, RegSet>,
+    ) {
+        unsafe {
+            for name in [c"memcpy", c"memmove", c"memset", c"memcmp", c"bcmp"]
+            {
+                let g = LLVMGetNamedFunction(self.module, name.as_ptr());
+                if clobbers.get(&g).is_none_or(|&set| set == 0) {
+                    continue;
+                }
+                let key = format!("no-builtin-{}", name.to_str().unwrap());
+                let attr = LLVMCreateStringAttribute(
+                    self.context,
+                    key.as_ptr().cast(),
+                    key.len() as u32,
+                    c"".as_ptr(),
+                    0,
+                );
+                for &f in defined {
+                    LLVMAddAttributeAtIndex(
+                        f,
+                        LLVMAttributeFunctionIndex,
+                        attr,
+                    );
+                }
+            }
         }
     }
 
