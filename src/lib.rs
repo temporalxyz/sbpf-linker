@@ -57,6 +57,8 @@ pub enum SbpfLinkerError {
         "Error handling rodata relocation in section={section} address={address:#x}: {detail}"
     )]
     RodataRelocationError { section: String, address: u64, detail: String },
+    #[error("`call sol_avx512` at text offset {offset:#x} {detail}")]
+    VectorPairError { offset: u64, detail: String },
 }
 
 impl SbpfLinkerError {

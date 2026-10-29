@@ -4,9 +4,11 @@
 //! `i32` values are opaque SSA tokens. On the whole program after LTO, this
 //! pass allocates `v0`–`v29` to the tokens and replaces every marker call with
 //! side-effecting inline asm that emits the encoded `CALL_IMM src=2`
-//! instruction as one `.quad`, or, with `SVM_VECTOR_TRANSPORT=call` (the
-//! default) or `asm`, with a `sol_avx512(desc, scalar, mask)` syscall whose
-//! descriptor is a constant in `.rodata.avx512`. Programs without markers are
+//! instruction as one `.quad`, or, with `SVM_VECTOR_TRANSPORT=asm` (the
+//! default) or `call`, with a `sol_avx512(desc, scalar, mask)` syscall whose
+//! descriptor is a constant in `.rodata.avx512`. `asm` keeps
+//! `lddw r1, desc; call sol_avx512` together in one asm block, which the link
+//! requires. Programs without markers are
 //! left untouched.
 
 pub mod ops;
@@ -230,7 +232,8 @@ enum Transport {
     Src2,
     /// An ordinary call `sol_avx512(desc, scalar, mask)`, lowered by LLVM.
     Call,
-    /// `lddw r1, desc; call sol_avx512` in one asm block.
+    /// `lddw r1, desc; call sol_avx512` in one asm block: LLVM cannot split,
+    /// hoist or tail-merge the pair apart.
     Asm,
 }
 
@@ -238,8 +241,8 @@ impl Transport {
     fn from_env() -> Self {
         match std::env::var("SVM_VECTOR_TRANSPORT").as_deref() {
             Ok("src2") => Transport::Src2,
-            Ok("asm") => Transport::Asm,
-            _ => Transport::Call,
+            Ok("call") => Transport::Call,
+            _ => Transport::Asm,
         }
     }
 }

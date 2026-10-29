@@ -725,6 +725,12 @@ pub fn parse_bytecode(
     match build_program(ast, arch, optimization) {
         Ok(mut parse_result) => {
             restore_vector_offsets(&mut parse_result);
+            if arch.is_v3() {
+                errors.extend(check_vector_pairs(&parse_result, rodata_size));
+                if !errors.is_empty() {
+                    return Err(errors);
+                }
+            }
             if compile_errors.is_empty() {
                 parse_result.debug_sections = debug_sections;
                 Ok(parse_result)
@@ -737,6 +743,69 @@ pub fn parse_bytecode(
             Err(SbpfLinkerError::from_compile_errors(compile_errors))
         }
     }
+}
+
+/// Every `call sol_avx512` must directly follow `lddw r1, <rodata address>`
+/// and no jump or call may target it, so the pair is one vector op.
+fn check_vector_pairs(
+    layout: &ProgramLayout,
+    rodata_size: u64,
+) -> Vec<SbpfLinkerError> {
+    let hash = i64::from(syscall_map::murmur3_32(VECTOR_SYSCALL));
+    let insns: Vec<(u64, &Instruction)> = layout
+        .code_section
+        .get_nodes()
+        .iter()
+        .filter_map(|node| match node {
+            ASTNode::Instruction { instruction, offset } => {
+                Some((*offset, instruction))
+            }
+            _ => None,
+        })
+        .collect();
+    let mut targets = std::collections::HashSet::new();
+    for &(offset, insn) in &insns {
+        let target = |slots: i64| (offset as i64 + (slots + 1) * 8) as u64;
+        if insn.is_jump()
+            && let Some(Either::Right(off)) = insn.off
+        {
+            targets.insert(target(i64::from(off)));
+        } else if insn.opcode == Opcode::Call
+            && insn.src.as_ref().is_some_and(|src| src.n == 1)
+            && let Some(Either::Right(Number::Int(imm))) = insn.imm
+        {
+            targets.insert(target(imm));
+        }
+    }
+    let mut errors = Vec::new();
+    for (k, &(offset, insn)) in insns.iter().enumerate() {
+        let is_vector_call = insn.opcode == Opcode::Call
+            && insn.src.as_ref().is_none_or(|src| src.n == 0)
+            && matches!(insn.imm, Some(Either::Right(Number::Int(imm))) if imm == hash);
+        if !is_vector_call {
+            continue;
+        }
+        let load = k.checked_sub(1).map(|j| insns[j].1).filter(|load| {
+            load.opcode == Opcode::Lddw
+                && load.dst.as_ref().is_some_and(|dst| dst.n == 1)
+                && matches!(load.imm, Some(Either::Right(Number::Int(a) | Number::Addr(a)))
+                    if (0..rodata_size as i64 - 15).contains(&a))
+        });
+        let detail = if load.is_none() {
+            Some("is not directly preceded by `lddw r1, <descriptor>`")
+        } else if targets.contains(&offset) {
+            Some("is the target of a jump or call")
+        } else {
+            None
+        };
+        if let Some(detail) = detail {
+            errors.push(SbpfLinkerError::VectorPairError {
+                offset,
+                detail: detail.to_owned(),
+            });
+        }
+    }
+    errors
 }
 
 fn resolve_rodata_label(
