@@ -221,6 +221,8 @@ pub const MOV: u8 = 0x09;
 /// `xor`, used to swap two registers in cyclic phi copies.
 pub const XOR: u8 = 0x2a;
 pub const LDN: u8 = 0x0c;
+/// `blendm`, a select between vectors under the `sol_avx512` transport.
+pub const BLENDM: u8 = 0x79;
 pub const STN: u8 = 0x0d;
 
 macro_rules! ops {
@@ -563,6 +565,21 @@ pub fn with_off(word: u64, off: i16) -> u64 {
 /// Sets the mask mode (the `dst` field) of an encoded op.
 pub fn with_mode(word: u64, mode: u8) -> u64 {
     word | u64::from(mode) << 8
+}
+
+/// The 16-byte `sol_avx512` descriptor of an encoded op: op, imm8, out,
+/// in0, in1, mask mode, `off` (i16 LE), 8 zero bytes.
+pub fn descriptor(word: u64) -> [u8; 16] {
+    let imm = (word >> 32) as u32;
+    let mut d = [0; 16];
+    d[0] = (imm >> 24) as u8;
+    d[1] = (imm >> 16) as u8;
+    d[2] = (imm >> 10 & 31) as u8;
+    d[3] = (imm >> 5 & 31) as u8;
+    d[4] = (imm & 31) as u8;
+    d[5] = (word >> 8 & 0xf) as u8;
+    d[6..8].copy_from_slice(&((word >> 16) as u16).to_le_bytes());
+    d
 }
 
 #[cfg(test)]

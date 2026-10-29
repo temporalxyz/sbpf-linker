@@ -4,7 +4,10 @@
 //! `i32` values are opaque SSA tokens. On the whole program after LTO, this
 //! pass allocates `v0`–`v29` to the tokens and replaces every marker call with
 //! side-effecting inline asm that emits the encoded `CALL_IMM src=2`
-//! instruction as one `.quad`. Programs without markers are left untouched.
+//! instruction as one `.quad`, or, with `SVM_VECTOR_TRANSPORT=call` (the
+//! default) or `asm`, with a `sol_avx512(desc, scalar, mask)` syscall whose
+//! descriptor is a constant in `.rodata.avx512`. Programs without markers are
+//! left untouched.
 
 pub mod ops;
 pub mod regalloc;
@@ -16,7 +19,8 @@ use std::{
 };
 
 use bpf_linker::llvm_sys::{
-    LLVMAttributeFunctionIndex, LLVMInlineAsmDialect, LLVMOpcode,
+    LLVMAttributeFunctionIndex, LLVMInlineAsmDialect, LLVMLinkage, LLVMOpcode,
+    LLVMTypeKind, LLVMUnnamedAddr,
     analysis::{LLVMVerifierFailureAction, LLVMVerifyModule},
     bit_reader::LLVMParseBitcodeInContext2,
     bit_writer::LLVMWriteBitcodeToMemoryBuffer,
@@ -30,7 +34,7 @@ use bpf_linker::llvm_sys::{
     },
 };
 
-use ops::{Kind, LD, LDN, MARKER_PREFIX, MOV, OpInfo, ST, STN, XOR};
+use ops::{BLENDM, Kind, LD, LDN, MARKER_PREFIX, MOV, OpInfo, ST, STN, XOR};
 use regalloc::{
     ALL_REGS, AllocError, Allocation, Inst, InstKind, Move, Phi, Reg, RegSet,
     Run, Tok,
@@ -100,7 +104,14 @@ pub fn lower_bitcode(bitcode: &[u8]) -> Result<Vec<u8>, VectorError> {
 pub unsafe fn lower_module(
     module: LLVMModuleRef,
 ) -> Result<bool, VectorError> {
-    unsafe { Pass::new(module).run() }
+    unsafe { lower_module_with(module, Transport::from_env()) }
+}
+
+unsafe fn lower_module_with(
+    module: LLVMModuleRef,
+    transport: Transport,
+) -> Result<bool, VectorError> {
+    unsafe { Pass::new(module, transport).run() }
 }
 
 enum Callee {
@@ -212,11 +223,35 @@ struct Function {
     preds: Vec<usize>,
 }
 
+/// How the ops reach the program.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Transport {
+    /// One `CALL_IMM src=2` per op.
+    Src2,
+    /// An ordinary call `sol_avx512(desc, scalar, mask)`, lowered by LLVM.
+    Call,
+    /// `lddw r1, desc; call sol_avx512` in one asm block.
+    Asm,
+}
+
+impl Transport {
+    fn from_env() -> Self {
+        match std::env::var("SVM_VECTOR_TRANSPORT").as_deref() {
+            Ok("src2") => Transport::Src2,
+            Ok("asm") => Transport::Asm,
+            _ => Transport::Call,
+        }
+    }
+}
+
 struct Pass {
     module: LLVMModuleRef,
     context: LLVMContextRef,
     markers: HashMap<LLVMValueRef, (&'static OpInfo, u8)>,
     errors: Vec<String>,
+    transport: Transport,
+    /// One `.rodata.avx512` constant per distinct descriptor.
+    descriptors: HashMap<[u8; 16], LLVMValueRef>,
 }
 
 unsafe fn value_name<'a>(value: LLVMValueRef) -> &'a str {
@@ -309,9 +344,16 @@ unsafe fn describe_origin(value: LLVMValueRef) -> &'static str {
 }
 
 impl Pass {
-    unsafe fn new(module: LLVMModuleRef) -> Self {
+    unsafe fn new(module: LLVMModuleRef, transport: Transport) -> Self {
         let context = unsafe { LLVMGetModuleContext(module) };
-        Self { module, context, markers: HashMap::new(), errors: Vec::new() }
+        Self {
+            module,
+            context,
+            markers: HashMap::new(),
+            errors: Vec::new(),
+            transport,
+            descriptors: HashMap::new(),
+        }
     }
 
     fn error(&mut self, function: Option<LLVMValueRef>, message: String) {
@@ -1263,14 +1305,22 @@ impl Pass {
     /// Emits ops that touch no scalar register. `r0` is declared clobbered
     /// because sbpf-linker's bytecode optimizer models every `call` as
     /// defining `r0`.
-    unsafe fn emit_words(&self, builder: LLVMBuilderRef, words: &[u64]) {
+    unsafe fn emit_words(&mut self, builder: LLVMBuilderRef, words: &[u64]) {
+        if self.transport != Transport::Src2 {
+            for &word in words {
+                unsafe {
+                    self.emit_syscall(builder, word, false, None, None, None)
+                };
+            }
+            return;
+        }
         let text = quads(words);
         let void = unsafe { LLVMVoidTypeInContext(self.context) };
         unsafe { self.emit_asm(builder, &text, "~{r0}", void, &[]) };
     }
 
     unsafe fn emit_op(
-        &self,
+        &mut self,
         builder: LLVMBuilderRef,
         op: &OpInfo,
         word: u64,
@@ -1279,6 +1329,17 @@ impl Pass {
         call: LLVMValueRef,
     ) -> LLVMValueRef {
         unsafe {
+            if self.transport != Transport::Src2 {
+                let ret = op.kind.defines_scalar().then(|| LLVMTypeOf(call));
+                return self.emit_syscall(
+                    builder,
+                    word,
+                    op.is_memory(),
+                    scalar,
+                    mask,
+                    ret,
+                );
+            }
             let text = quads(&[word]);
             let mut constraints = Vec::new();
             let ret = if op.kind.defines_scalar() {
@@ -1302,6 +1363,161 @@ impl Pass {
             let args: Vec<LLVMValueRef> =
                 scalar.into_iter().chain(mask).collect();
             self.emit_asm(builder, &text, &constraints.join(","), ret, &args)
+        }
+    }
+
+    /// The `.rodata.avx512` constant holding the descriptor of `word`.
+    unsafe fn descriptor(&mut self, word: u64) -> LLVMValueRef {
+        let bytes = ops::descriptor(word);
+        if let Some(&global) = self.descriptors.get(&bytes) {
+            return global;
+        }
+        unsafe {
+            let init = LLVMConstStringInContext2(
+                self.context,
+                bytes.as_ptr().cast(),
+                bytes.len(),
+                1,
+            );
+            let global = LLVMAddGlobal(
+                self.module,
+                LLVMTypeOf(init),
+                c"svm.desc".as_ptr(),
+            );
+            LLVMSetInitializer(global, init);
+            LLVMSetGlobalConstant(global, 1);
+            LLVMSetLinkage(global, LLVMLinkage::LLVMPrivateLinkage);
+            LLVMSetUnnamedAddress(
+                global,
+                LLVMUnnamedAddr::LLVMGlobalUnnamedAddr,
+            );
+            LLVMSetSection(global, c".rodata.avx512".as_ptr());
+            LLVMSetAlignment(global, 8);
+            self.descriptors.insert(bytes, global);
+            global
+        }
+    }
+
+    /// Emits `sol_avx512(desc, scalar, mask)`: `r1` = descriptor, `r2` =
+    /// scalar, `r3` = mask, `r0` = scalar result.
+    unsafe fn emit_syscall(
+        &mut self,
+        builder: LLVMBuilderRef,
+        word: u64,
+        memory: bool,
+        scalar: Option<LLVMValueRef>,
+        mask: Option<LLVMValueRef>,
+        ret: Option<LLVMTypeRef>,
+    ) -> LLVMValueRef {
+        unsafe {
+            let desc = self.descriptor(word);
+            let i64_ty = LLVMInt64TypeInContext(self.context);
+            let widen = |v: LLVMValueRef| {
+                let ty = LLVMTypeOf(v);
+                if LLVMGetTypeKind(ty) == LLVMTypeKind::LLVMPointerTypeKind {
+                    LLVMBuildPtrToInt(builder, v, i64_ty, c"".as_ptr())
+                } else if LLVMGetIntTypeWidth(ty) < 64 {
+                    LLVMBuildZExt(builder, v, i64_ty, c"".as_ptr())
+                } else {
+                    v
+                }
+            };
+            if self.transport == Transport::Asm {
+                let mut constraints = Vec::new();
+                if ret.is_some() {
+                    constraints.push("={r0}");
+                }
+                constraints.push("i");
+                let mut args = vec![desc];
+                if let Some(s) = scalar {
+                    constraints.push("{r2}");
+                    args.push(widen(s));
+                }
+                if let Some(m) = mask {
+                    constraints.push("{r3}");
+                    args.push(widen(m));
+                }
+                constraints.push("~{r1}");
+                if ret.is_none() {
+                    constraints.push("~{r0}");
+                }
+                if memory {
+                    constraints.push("~{memory}");
+                }
+                let text = format!(
+                    "r1 = ${{{}}} ll\ncall sol_avx512",
+                    usize::from(ret.is_some())
+                );
+                let result = self.emit_asm(
+                    builder,
+                    &text,
+                    &constraints.join(","),
+                    if ret.is_some() {
+                        i64_ty
+                    } else {
+                        LLVMVoidTypeInContext(self.context)
+                    },
+                    &args,
+                );
+                return match ret {
+                    Some(ty) if ty != i64_ty => {
+                        LLVMBuildTrunc(builder, result, ty, c"".as_ptr())
+                    }
+                    _ => result,
+                };
+            }
+            let ptr_ty = LLVMPointerTypeInContext(self.context, 0);
+            let mut params = [ptr_ty, i64_ty, i64_ty];
+            let fn_ty = LLVMFunctionType(i64_ty, params.as_mut_ptr(), 3, 0);
+            let mut callee =
+                LLVMGetNamedFunction(self.module, c"sol_avx512".as_ptr());
+            if callee.is_null() {
+                callee = LLVMAddFunction(
+                    self.module,
+                    c"sol_avx512".as_ptr(),
+                    fn_ty,
+                );
+            }
+            let poison = LLVMGetPoison(i64_ty);
+            let mut args = [
+                desc,
+                scalar.map_or(poison, widen),
+                mask.map_or(poison, widen),
+            ];
+            let call = LLVMBuildCall2(
+                builder,
+                fn_ty,
+                callee,
+                args.as_mut_ptr(),
+                3,
+                c"".as_ptr(),
+            );
+            let attr = |name: &str, value| {
+                let kind = LLVMGetEnumAttributeKindForName(
+                    name.as_ptr().cast(),
+                    name.len(),
+                );
+                LLVMCreateEnumAttribute(self.context, kind, value)
+            };
+            LLVMAddCallSiteAttribute(
+                call,
+                LLVMAttributeFunctionIndex,
+                attr("nounwind", 0),
+            );
+            if !memory {
+                // memory(inaccessiblemem: readwrite): the vector registers
+                LLVMAddCallSiteAttribute(
+                    call,
+                    LLVMAttributeFunctionIndex,
+                    attr("memory", 3 << 2),
+                );
+            }
+            match ret {
+                Some(ty) if ty != i64_ty => {
+                    LLVMBuildTrunc(builder, call, ty, c"".as_ptr())
+                }
+                _ => call,
+            }
         }
     }
 
@@ -1375,7 +1591,7 @@ impl Pass {
 
     /// `out ← cond ? a : b` as a conditional move inside one asm block.
     unsafe fn emit_select(
-        &self,
+        &mut self,
         builder: LLVMBuilderRef,
         select: LLVMValueRef,
         out: Reg,
@@ -1395,6 +1611,27 @@ impl Pass {
                     if a != out {
                         self.emit_words(builder, &[mov(out, a)]);
                     }
+                    return;
+                }
+                (Some(a), Some(b)) if self.transport != Transport::Src2 => {
+                    // out ← cond ? a : b as `blendm.q` on an all-ones or
+                    // zero mask
+                    let i64_ty = LLVMInt64TypeInContext(self.context);
+                    let mask = LLVMBuildSExt(
+                        builder,
+                        LLVMGetOperand(select, 0),
+                        i64_ty,
+                        c"".as_ptr(),
+                    );
+                    let word = ops::encode(BLENDM, 3, out, b, a);
+                    self.emit_syscall(
+                        builder,
+                        word,
+                        false,
+                        None,
+                        Some(mask),
+                        None,
+                    );
                     return;
                 }
                 (Some(a), Some(b)) if a == out => {

@@ -24,6 +24,8 @@ use crate::fuse_args_stack::{
 
 const BPF_TRAP: &str = "__bpf_trap";
 const ABORT_SYSCALL: &str = "abort";
+/// The vector op syscall (see `crate::vector`), not in sbpf-common's list.
+const VECTOR_SYSCALL: &str = "sol_avx512";
 
 fn decode_instruction_for_arch(
     data: &[u8],
@@ -602,7 +604,14 @@ pub fn parse_bytecode(
                                 } else {
                                     name
                                 };
-                            node.imm = Some(Either::Left(name.to_owned()));
+                            if name == VECTOR_SYSCALL && arch.is_v3() {
+                                node.src = Some(Register { n: 0 });
+                                node.imm = Some(Either::Right(Number::Int(
+                                    i64::from(syscall_map::murmur3_32(name)),
+                                )));
+                            } else {
+                                node.imm = Some(Either::Left(name.to_owned()));
+                            }
                         }
                     }
                     Ok(())

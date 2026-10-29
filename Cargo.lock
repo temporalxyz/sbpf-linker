@@ -1126,6 +1126,7 @@ dependencies = [
  "rustc-demangle",
  "sbpf-assembler",
  "sbpf-common",
+ "sbpf-syscall-map",
  "thiserror 2.0.18",
  "tracing",
  "tracing-appender",

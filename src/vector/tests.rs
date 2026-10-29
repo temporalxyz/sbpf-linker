@@ -6,7 +6,7 @@ use std::ffi::CStr;
 
 use bpf_linker::llvm_sys::core::*;
 
-use super::{lower_module, parse_ir};
+use super::{Transport, lower_module, lower_module_with, parse_ir};
 
 const DECLS: &str = r#"
 target triple = "bpfel"
@@ -48,12 +48,82 @@ struct Lowered {
     words: Vec<Word>,
 }
 
+/// Lowers under `src=2` and checks that the `sol_avx512` transports emit
+/// the same ops as descriptors (selects become `blendm` there instead).
 fn lower(body: &str) -> Result<Lowered, String> {
+    let lowered = lower_as(body, Transport::Src2);
+    if let Ok(l) = &lowered
+        && !body.contains(" select ")
+    {
+        let expected: Vec<[u8; 16]> =
+            words(&l.ir).into_iter().map(super::ops::descriptor).collect();
+        for transport in [Transport::Call, Transport::Asm] {
+            let other = lower_as(body, transport).unwrap();
+            assert!(!other.ir.contains(".quad"), "{}", other.ir);
+            assert_eq!(descriptors(&other.ir), expected, "{transport:?}");
+        }
+    }
+    lowered
+}
+
+/// Every emitted `.quad` word, in order.
+fn words(ir: &str) -> Vec<u64> {
+    ir.split(".quad 0x")
+        .skip(1)
+        .map(|s| u64::from_str_radix(&s[..16], 16).unwrap())
+        .collect()
+}
+
+/// The descriptor of every `sol_avx512` call, in order.
+fn descriptors(ir: &str) -> Vec<[u8; 16]> {
+    let mut globals = std::collections::HashMap::new();
+    for line in ir.lines() {
+        let Some((name, rest)) =
+            line.split_once(" = private unnamed_addr constant [16 x i8] ")
+        else {
+            continue;
+        };
+        assert!(rest.contains("section \".rodata.avx512\""), "{line}");
+        if rest.starts_with("zeroinitializer") {
+            globals.insert(name.trim().to_owned(), [0; 16]);
+        } else if let Some(rest) = rest.strip_prefix("c\"") {
+            let text = rest.split('"').next().unwrap().as_bytes();
+            let mut bytes = Vec::new();
+            let mut i = 0;
+            while i < text.len() {
+                if text[i] == b'\\' {
+                    let hex =
+                        std::str::from_utf8(&text[i + 1..i + 3]).unwrap();
+                    bytes.push(u8::from_str_radix(hex, 16).unwrap());
+                    i += 3;
+                } else {
+                    bytes.push(text[i]);
+                    i += 1;
+                }
+            }
+            globals.insert(
+                name.trim().to_owned(),
+                <[u8; 16]>::try_from(bytes).unwrap(),
+            );
+        }
+    }
+    ir.lines()
+        .filter(|line| line.contains("sol_avx512"))
+        .filter_map(|line| line.split_once("(ptr @"))
+        .map(|(_, rest)| {
+            let name = rest.split([',', ')']).next().unwrap();
+            globals[&format!("@{name}")]
+        })
+        .collect()
+}
+
+fn lower_as(body: &str, transport: Transport) -> Result<Lowered, String> {
     unsafe {
         let context = LLVMContextCreate();
         let module = parse_ir(context, &format!("{DECLS}\n{body}"));
-        let result =
-            lower_module(module).map_err(|e| e.to_string()).map(|_| {
+        let result = lower_module_with(module, transport)
+            .map_err(|e| e.to_string())
+            .map(|_| {
                 let printed = LLVMPrintModuleToString(module);
                 let ir =
                     CStr::from_ptr(printed).to_string_lossy().into_owned();
@@ -1278,4 +1348,76 @@ define void @f(ptr %p, i64 %k) {
         ]
     );
     assert_eq!(modes(&l.ir), [0, 0, 1, 0, 0, 0]);
+}
+
+#[test]
+fn syscall_transport_passes_descriptor_scalar_and_mask() {
+    let body = r#"
+define i64 @f(ptr %p, i64 %k) {
+  %a = call i32 @__svm_ld(ptr %p)
+  %b = call i32 @__svm_add_d_maskz(i32 %a, i32 %a, i64 %k)
+  %c = call i32 @__svm_add_d(i32 %b, i32 %a)
+  %d = call i32 @__svm_add_d(i32 %c, i32 %a)
+  %h = call i64 @__svm_hsum_d(i32 %d)
+  ret i64 %h
+}
+"#;
+    let call = lower_as(body, Transport::Call).unwrap();
+    // one call per op; the ops that don't touch program memory only
+    // touch the vector registers
+    let calls: Vec<&str> = call
+        .ir
+        .lines()
+        .filter(|line| line.contains("call i64 @sol_avx512("))
+        .collect();
+    assert_eq!(calls.len(), 5, "{}", call.ir);
+    assert!(calls[0].contains("(ptr @svm.desc, i64 %"), "{}", call.ir);
+    assert!(calls[1].contains(", i64 poison, i64 %k) #1"), "{}", call.ir);
+    assert!(calls[1..].iter().all(|c| c.ends_with("#1")), "{}", call.ir);
+    assert!(
+        call.ir.contains(
+            "attributes #1 = { nounwind memory(inaccessiblemem: readwrite) }"
+        ),
+        "{}",
+        call.ir
+    );
+    let asm = lower_as(body, Transport::Asm).unwrap();
+    assert!(asm.ir.contains(r#""r1 = ${0} ll\0Acall sol_avx512", "i,{r2},~{r1},~{r0},~{memory}""#), "{}", asm.ir);
+    assert!(asm.ir.contains(r#""i,{r3},~{r1},~{r0}""#), "{}", asm.ir);
+    assert!(
+        asm.ir
+            .contains(r#""r1 = ${1} ll\0Acall sol_avx512", "={r0},i,~{r1}""#),
+        "{}",
+        asm.ir
+    );
+}
+
+#[test]
+fn syscall_transport_select_is_blendm() {
+    let body = r#"
+define void @f(ptr %p, i1 %c) {
+  %a = call i32 @__svm_ld(ptr %p)
+  %b = call i32 @__svm_ld(ptr %p)
+  %s = select i1 %c, i32 %a, i32 %b
+  call void @__svm_st(i32 %s, ptr %p)
+  call void @__svm_st(i32 %a, ptr %p)
+  call void @__svm_st(i32 %b, ptr %p)
+  ret void
+}
+"#;
+    for transport in [Transport::Call, Transport::Asm] {
+        let l = lower_as(body, transport).unwrap();
+        let d = descriptors(&l.ir);
+        let blendm: Vec<_> =
+            d.iter().filter(|d| d[0] == super::ops::BLENDM).collect();
+        assert_eq!(blendm.len(), 1, "{}", l.ir);
+        // out ← mask ? in1 (a) : in0 (b), q lanes
+        assert_eq!(
+            blendm[0][..5],
+            [super::ops::BLENDM, 3, 2, 1, 0],
+            "{}",
+            l.ir
+        );
+        assert!(l.ir.contains("sext i1 %c to i64"), "{}", l.ir);
+    }
 }
