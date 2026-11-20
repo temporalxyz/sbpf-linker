@@ -14,15 +14,12 @@ declare i32 @__svm_ld(ptr)
 declare void @__svm_st(i32, ptr)
 declare i32 @__svm_zero()
 declare i32 @__svm_splat_d(i64)
-declare i32 @__svm_add_d(i32, i32)
-declare i32 @__svm_sub_d(i32, i32)
+declare i32 @__svm_add_q(i32, i32)
+declare i32 @__svm_sub_q(i32, i32)
 declare i32 @__svm_dpbusd(i32, i32, i32)
 declare i32 @__svm_ternlog(i32, i32, i32, i32)
-declare i32 @__svm_shli_d(i32, i32)
-declare i64 @__svm_hsum_d(i32)
-declare i64 @__svm_extract_q(i32, i32)
-declare i32 @__svm_insert_q(i32, i64, i32)
-declare i32 @__svm_clmul(i32, i32, i32)
+declare i32 @__svm_shli_q(i32, i32)
+declare i32 @__svm_roli_q(i32, i32)
 declare void @sink(i32)
 "#;
 
@@ -105,7 +102,7 @@ fn straight_line() {
 define void @f(ptr %p, ptr %q) {
   %a = call i32 @__svm_ld(ptr %p)
   %b = call i32 @__svm_ld(ptr %q)
-  %c = call i32 @__svm_add_d(i32 %a, i32 %b)
+  %c = call i32 @__svm_add_q(i32 %a, i32 %b)
   call void @__svm_st(i32 %c, ptr %p)
   ret void
 }
@@ -118,7 +115,7 @@ define void @f(ptr %p, ptr %q) {
         [
             (0x00, 0, 0, 0, 0),
             (0x00, 0, 1, 0, 0),
-            (0x12, 0, 0, 0, 1),
+            (0x13, 0, 0, 0, 1),
             (0x01, 0, 0, 0, 0)
         ]
     );
@@ -128,7 +125,7 @@ define void @f(ptr %p, ptr %q) {
     assert!(l.ir.contains(r#""{r1},~{r0},~{memory}"(ptr %q)"#), "{}", l.ir);
     assert!(
         l.ir.contains(
-            r#"asm sideeffect ".quad 0x1200000100002085", "~{r0}"()"#
+            r#"asm sideeffect ".quad 0x1300000100002085", "~{r0}"()"#
         ),
         "{}",
         l.ir
@@ -156,11 +153,11 @@ define void @f(ptr %p, i64 %x) {
   %e = call i32 @__svm_ld(ptr getelementptr (i8, ptr @g, i64 128))
   %y = add i64 %x, 8
   %s = call i32 @__svm_splat_d(i64 %y)
-  %t = call i32 @__svm_add_d(i32 %a, i32 %b)
-  %u = call i32 @__svm_add_d(i32 %c, i32 %d)
-  %v = call i32 @__svm_add_d(i32 %e, i32 %s)
-  %w = call i32 @__svm_add_d(i32 %t, i32 %u)
-  %z = call i32 @__svm_add_d(i32 %w, i32 %v)
+  %t = call i32 @__svm_add_q(i32 %a, i32 %b)
+  %u = call i32 @__svm_add_q(i32 %c, i32 %d)
+  %v = call i32 @__svm_add_q(i32 %e, i32 %s)
+  %w = call i32 @__svm_add_q(i32 %t, i32 %u)
+  %z = call i32 @__svm_add_q(i32 %w, i32 %v)
   call void @__svm_st(i32 %z, ptr %p64)
   ret void
 }
@@ -181,7 +178,7 @@ define void @f(ptr %p, i64 %x) {
 fn loop_carried_accumulator() {
     let l = lower(
         r#"
-define i64 @f(ptr %p, i64 %n) {
+define void @f(ptr %p, i64 %n) {
 entry:
   %z = call i32 @__svm_zero()
   br label %loop
@@ -194,20 +191,17 @@ loop:
   %c = icmp ult i64 %i1, %n
   br i1 %c, label %loop, label %exit
 exit:
-  %s = call i64 @__svm_hsum_d(i32 %acc1)
-  ret i64 %s
+  call void @__svm_st(i32 %acc1, ptr %p)
+  ret void
 }
 "#,
     )
     .unwrap();
     // No moves: the phi, the accumulator and its update share v0.
-    assert_eq!(ops(&l.words), [0x08, 0x00, 0x50, 0x70]);
+    assert_eq!(ops(&l.words), [0x08, 0x00, 0x50, 0x01]);
     assert_eq!(l.words[0].2, 0);
     assert_eq!(l.words[2], (0x50, 0, 0, 1, 1));
-    assert_eq!(l.words[3], (0x70, 0, 0, 0, 0));
-    assert!(l.ir.contains(
-        r#"call i64 asm sideeffect ".quad 0x7000000000002085", "={r0}"()"#
-    ));
+    assert_eq!(l.words[3], (0x01, 0, 0, 0, 0));
 }
 
 #[test]
@@ -215,7 +209,7 @@ fn loop_carried_non_accumulating_op() {
     // acc = acc + x: the add is not tied, but phi affinity still avoids moves.
     let l = lower(
         r#"
-define i64 @f(ptr %p, i64 %n) {
+define void @f(ptr %p, i64 %n) {
 entry:
   %z = call i32 @__svm_zero()
   %k = call i32 @__svm_splat_d(i64 7)
@@ -224,19 +218,19 @@ loop:
   %i = phi i64 [ 0, %entry ], [ %i1, %loop ]
   %acc = phi i32 [ %z, %entry ], [ %acc1, %loop ]
   %x = call i32 @__svm_ld(ptr %p)
-  %y = call i32 @__svm_add_d(i32 %x, i32 %k)
-  %acc1 = call i32 @__svm_add_d(i32 %y, i32 %acc)
+  %y = call i32 @__svm_add_q(i32 %x, i32 %k)
+  %acc1 = call i32 @__svm_add_q(i32 %y, i32 %acc)
   %i1 = add i64 %i, 1
   %c = icmp ult i64 %i1, %n
   br i1 %c, label %loop, label %exit
 exit:
-  %s = call i64 @__svm_hsum_d(i32 %acc1)
-  ret i64 %s
+  call void @__svm_st(i32 %acc1, ptr %p)
+  ret void
 }
 "#,
     )
     .unwrap();
-    assert_eq!(ops(&l.words), [0x08, 0x06, 0x00, 0x12, 0x12, 0x70]);
+    assert_eq!(ops(&l.words), [0x08, 0x06, 0x00, 0x13, 0x13, 0x01]);
     let acc = l.words[0].2;
     assert_eq!(l.words[4].2, acc, "{:?}", l.words);
     assert_ne!(l.words[3].2, acc);
@@ -246,7 +240,7 @@ exit:
 fn nested_loops() {
     let l = lower(
         r#"
-define i64 @f(ptr %p, i64 %n) {
+define void @f(ptr %p, i64 %n) {
 entry:
   %z = call i32 @__svm_zero()
   br label %outer
@@ -264,22 +258,22 @@ inner:
   %cj = icmp ult i64 %j1, %n
   br i1 %cj, label %inner, label %outer.latch
 outer.latch:
-  %acc2 = call i32 @__svm_add_d(i32 %acc, i32 %in1)
+  %acc2 = call i32 @__svm_add_q(i32 %acc, i32 %in1)
   %i1 = add i64 %i, 1
   %ci = icmp ult i64 %i1, %n
   br i1 %ci, label %outer, label %exit
 exit:
-  %s = call i64 @__svm_hsum_d(i32 %acc2)
-  ret i64 %s
+  call void @__svm_st(i32 %acc2, ptr %p)
+  ret void
 }
 "#,
     )
     .unwrap();
-    assert_eq!(ops(&l.words), [0x08, 0x08, 0x00, 0x50, 0x12, 0x70]);
+    assert_eq!(ops(&l.words), [0x08, 0x08, 0x00, 0x50, 0x13, 0x01]);
     let (acc, inner) = (l.words[0].2, l.words[1].2);
     assert_ne!(acc, inner);
     assert_eq!(l.words[3].2, inner);
-    assert_eq!(l.words[4], (0x12, 0, acc, acc, inner));
+    assert_eq!(l.words[4], (0x13, 0, acc, acc, inner));
 }
 
 #[test]
@@ -291,14 +285,14 @@ entry:
   %a = call i32 @__svm_ld(ptr %p)
   br i1 %c, label %then, label %else
 then:
-  %t = call i32 @__svm_add_d(i32 %a, i32 %a)
+  %t = call i32 @__svm_add_q(i32 %a, i32 %a)
   br label %merge
 else:
-  %e = call i32 @__svm_sub_d(i32 %a, i32 %a)
+  %e = call i32 @__svm_sub_q(i32 %a, i32 %a)
   br label %merge
 merge:
   %m = phi i32 [ %t, %then ], [ %e, %else ]
-  %r = call i32 @__svm_add_d(i32 %m, i32 %a)
+  %r = call i32 @__svm_add_q(i32 %m, i32 %a)
   call void @__svm_st(i32 %r, ptr %p)
   ret void
 }
@@ -306,11 +300,11 @@ merge:
     )
     .unwrap();
     // Both arms write the phi's register directly; no moves needed.
-    assert_eq!(ops(&l.words), [0x00, 0x12, 0x16, 0x12, 0x01]);
+    assert_eq!(ops(&l.words), [0x00, 0x13, 0x17, 0x13, 0x01]);
     assert_eq!(l.words[1].2, l.words[2].2);
     assert_eq!(
         l.words[3],
-        (0x12, 0, l.words[3].2, l.words[1].2, l.words[0].2)
+        (0x13, 0, l.words[3].2, l.words[1].2, l.words[0].2)
     );
 }
 
@@ -325,18 +319,18 @@ entry:
   %a = call i32 @__svm_ld(ptr %p)
   br i1 %c, label %then, label %merge
 then:
-  %t = call i32 @__svm_add_d(i32 %a, i32 %a)
+  %t = call i32 @__svm_add_q(i32 %a, i32 %a)
   br label %merge
 merge:
   %m = phi i32 [ %t, %then ], [ %a, %entry ]
-  %r = call i32 @__svm_add_d(i32 %m, i32 %a)
+  %r = call i32 @__svm_add_q(i32 %m, i32 %a)
   call void @__svm_st(i32 %r, ptr %p)
   ret void
 }
 "#,
     )
     .unwrap();
-    assert_eq!(ops(&l.words), [0x00, 0x09, 0x12, 0x12, 0x01], "{}", l.ir);
+    assert_eq!(ops(&l.words), [0x00, 0x09, 0x13, 0x13, 0x01], "{}", l.ir);
     assert!(l.ir.contains("entry.merge_crit_edge:"), "{}", l.ir);
     // The copy writes the phi's register, which the `then` arm defines.
     assert_eq!(l.words[1].2, l.words[2].2);
@@ -390,14 +384,12 @@ define void @f(ptr %p) {
 fn immediates_and_scalars() {
     let l = lower(
         r#"
-define i64 @f(i64 %x) {
+define void @f(i64 %x, ptr %p) {
   %a = call i32 @__svm_splat_d(i64 %x)
-  %b = call i32 @__svm_shli_d(i32 %a, i32 5)
-  %c = call i32 @__svm_insert_q(i32 %b, i64 %x, i32 3)
-  %d = call i32 @__svm_clmul(i32 %c, i32 %b, i32 17)
-  %e = call i64 @__svm_extract_q(i32 %d, i32 7)
-  %r = add i64 %e, %x
-  ret i64 %r
+  %b = call i32 @__svm_shli_q(i32 %a, i32 5)
+  %d = call i32 @__svm_roli_q(i32 %b, i32 63)
+  call void @__svm_st(i32 %d, ptr %p)
+  ret void
 }
 "#,
     )
@@ -406,19 +398,14 @@ define i64 @f(i64 %x) {
         l.words,
         [
             (0x06, 0, 0, 0, 0),
-            (0x31, 5, 0, 0, 0),
-            (0x09, 0, 1, 0, 0),
-            (0x74, 3, 1, 0, 0),
-            (0x78, 0x11, 0, 1, 0),
-            (0x72, 7, 0, 0, 0)
+            (0x32, 5, 0, 0, 0),
+            (0x3a, 63, 0, 0, 0),
+            (0x01, 0, 0, 0, 0)
         ]
     );
-    // splat and insert read r1 but not memory; extract defines r0.
+    // splat reads r1 but not memory; only st clobbers memory.
     assert!(l.ir.contains(r#""{r1},~{r0}"(i64 %x)"#), "{}", l.ir);
-    assert!(l.ir.contains(
-        r#"= call i64 asm sideeffect ".quad 0x7207000000002085", "={r0}"()"#
-    ));
-    assert!(!l.ir.contains("~{memory}"));
+    assert_eq!(l.ir.matches("~{memory}").count(), 1, "{}", l.ir);
 }
 
 #[test]
@@ -449,7 +436,7 @@ fn values_live_across_calls_avoid_callee_registers() {
         r#"
 define internal void @helper(ptr %p) noinline {
   %a = call i32 @__svm_ld(ptr %p)
-  %b = call i32 @__svm_add_d(i32 %a, i32 %a)
+  %b = call i32 @__svm_add_q(i32 %a, i32 %a)
   call void @__svm_st(i32 %b, ptr %p)
   ret void
 }
@@ -466,25 +453,25 @@ define void @f(ptr %p) {
     // helper uses v0; %x must not live in it.
     assert_eq!(
         l.words[..3],
-        [(0x00, 0, 0, 0, 0), (0x12, 0, 0, 0, 0), (0x01, 0, 0, 0, 0)]
+        [(0x00, 0, 0, 0, 0), (0x13, 0, 0, 0, 0), (0x01, 0, 0, 0, 0)]
     );
     assert_eq!(l.words[3], (0x00, 0, 1, 0, 0));
 }
 
 #[test]
-fn thirty_live_values_fit() {
+fn sixteen_live_values_fit() {
     let mut body = String::from("define void @f(ptr %p) {\n");
-    for i in 0..30 {
+    for i in 0..16 {
         body += &format!("  %v{i} = call i32 @__svm_ld(ptr %p)\n");
     }
-    for i in 0..30 {
+    for i in 0..16 {
         body += &format!("  call void @__svm_st(i32 %v{i}, ptr %p)\n");
     }
     body += "  ret void\n}\n";
     let l = lower(&body).unwrap();
-    let mut outs: Vec<u8> = l.words[..30].iter().map(|w| w.2).collect();
+    let mut outs: Vec<u8> = l.words[..16].iter().map(|w| w.2).collect();
     outs.sort();
-    assert_eq!(outs, (0..30).collect::<Vec<_>>());
+    assert_eq!(outs, (0..16).collect::<Vec<_>>());
 }
 
 fn error(body: &str) -> String {
@@ -497,10 +484,10 @@ fn error(body: &str) -> String {
 #[test]
 fn straight_line_overflow_spills() {
     let mut body = String::from("define void @f(ptr %p) {\n");
-    for i in 0..32 {
+    for i in 0..18 {
         body += &format!("  %v{i} = call i32 @__svm_ld(ptr %p)\n");
     }
-    for i in 0..32 {
+    for i in 0..18 {
         body += &format!("  call void @__svm_st(i32 %v{i}, ptr %p)\n");
     }
     body += "  ret void\n}\n";
@@ -512,8 +499,8 @@ fn straight_line_overflow_spills() {
         "{}",
         l.ir
     );
-    assert_eq!(ops(&l.words).iter().filter(|&&op| op == 0x00).count(), 34);
-    assert_eq!(ops(&l.words).iter().filter(|&&op| op == 0x01).count(), 34);
+    assert_eq!(ops(&l.words).iter().filter(|&&op| op == 0x00).count(), 20);
+    assert_eq!(ops(&l.words).iter().filter(|&&op| op == 0x01).count(), 20);
     assert!(
         l.ir.contains(r#""{r1},~{r0},~{memory}"(ptr %svm.spill)"#),
         "{}",
@@ -523,21 +510,21 @@ fn straight_line_overflow_spills() {
 
 #[test]
 fn error_too_many_live() {
-    // 31 values live around a loop cannot be spilled.
+    // 17 values live around a loop cannot be spilled.
     let mut body = String::from("define void @f(ptr %p, i64 %n) {\nentry:\n");
-    for i in 0..31 {
+    for i in 0..17 {
         body += &format!("  %v{i} = call i32 @__svm_ld(ptr %p)\n");
     }
     body += "  br label %loop\nloop:\n  %i = phi i64 [ 0, %entry ], [ %i1, %loop ]\n";
     body += "  %i1 = add i64 %i, 1\n  %c = icmp ult i64 %i1, %n\n";
     body += "  br i1 %c, label %loop, label %exit\nexit:\n";
-    for i in 0..31 {
+    for i in 0..17 {
         body += &format!("  call void @__svm_st(i32 %v{i}, ptr %p)\n");
     }
     body += "  ret void\n}\n";
     let e = error(&body);
     assert!(
-        e.contains("in `f`: 31 vector values are live at the same time"),
+        e.contains("in `f`: 17 vector values are live at the same time"),
         "{e}"
     );
     assert!(e.contains("at op `ld`"), "{e}");
@@ -598,14 +585,14 @@ fn error_non_vector_operands() {
         r#"
 define void @f(ptr %p) {
   %a = load i32, ptr %p
-  %b = call i32 @__svm_add_d(i32 %a, i32 %a)
+  %b = call i32 @__svm_add_q(i32 %a, i32 %a)
   call void @__svm_st(i32 %b, ptr %p)
   ret void
 }
 "#,
     );
     assert!(
-        e.contains("vector operand 0 of `__svm_add_d` is a load from memory"),
+        e.contains("vector operand 0 of `__svm_add_q` is a load from memory"),
         "{e}"
     );
 
@@ -643,7 +630,7 @@ fn error_immediates() {
         r#"
 define void @f(ptr %p, i32 %n) {
   %a = call i32 @__svm_ld(ptr %p)
-  %b = call i32 @__svm_shli_d(i32 %a, i32 %n)
+  %b = call i32 @__svm_shli_q(i32 %a, i32 %n)
   call void @__svm_st(i32 %b, ptr %p)
   ret void
 }
@@ -651,7 +638,7 @@ define void @f(ptr %p, i32 %n) {
     );
     assert!(
         e.contains(
-            "the immediate of `__svm_shli_d` is not a compile-time constant"
+            "the immediate of `__svm_shli_q` is not a compile-time constant"
         ),
         "{e}"
     );
@@ -660,15 +647,18 @@ define void @f(ptr %p, i32 %n) {
         r#"
 define void @f(ptr %p) {
   %a = call i32 @__svm_ld(ptr %p)
-  %b = call i32 @__svm_shli_d(i32 %a, i32 32)
-  %c = call i32 @__svm_clmul(i32 %b, i32 %b, i32 2)
+  %b = call i32 @__svm_shli_q(i32 %a, i32 64)
+  %c = call i32 @__svm_ternlog(i32 %b, i32 %b, i32 %b, i32 256)
   call void @__svm_st(i32 %c, ptr %p)
   ret void
 }
 "#,
     );
-    assert!(e.contains("immediate 0x20 is out of range for `shli.d`"), "{e}");
-    assert!(e.contains("immediate 0x2 is out of range for `clmul`"), "{e}");
+    assert!(e.contains("immediate 0x40 is out of range for `shli.q`"), "{e}");
+    assert!(
+        e.contains("immediate 0x100 is out of range for `ternlog`"),
+        "{e}"
+    );
 }
 
 #[test]

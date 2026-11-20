@@ -8,19 +8,19 @@
 //! the result is checked by simulating the register contents.
 //!
 //! Before coloring, values are spilled to 64-byte stack slots wherever more
-//! than 30 would be live, as long as their remaining uses are in the same
+//! than 16 would be live, as long as their remaining uses are in the same
 //! block (straight-line overflow).
 
 use std::{collections::HashMap, fmt};
 
 /// An SSA vector value.
 pub type Tok = u32;
-/// A vector register `v0`–`v29`.
+/// A vector register `v0`–`v15`.
 pub type Reg = u8;
 /// A bit set of registers.
 pub type RegSet = u32;
 
-pub const NUM_REGS: u8 = 30;
+pub const NUM_REGS: u8 = 16;
 pub const ALL_REGS: RegSet = (1 << NUM_REGS) - 1;
 
 pub struct Func {
@@ -93,7 +93,7 @@ pub struct Allocation {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum AllocError {
-    /// More than 30 values are live at instruction `inst` of `block`
+    /// More than 16 values are live at instruction `inst` of `block`
     /// (`None` for the phis at the block's top).
     TooManyLive { block: usize, inst: Option<usize>, live: usize },
     /// The value defined there is live across calls that, together with
@@ -246,6 +246,50 @@ fn pick(free: RegSet, prefs: impl IntoIterator<Item = Reg>) -> Option<Reg> {
         .or_else(|| (free != 0).then(|| free.trailing_zeros() as Reg))
 }
 
+/// Renumbers spill slots so that slots whose contents are never needed at
+/// the same time share one. A slot is in use from its store to its last
+/// reload, both in the same block. Returns the number of slots.
+fn share_slots(func: &mut Func) -> u32 {
+    let mut slots = 0;
+    for block in &mut func.blocks {
+        // Old slot -> (store, last reload), in store order.
+        let mut spans: Vec<(u32, usize, usize)> = Vec::new();
+        for (i, inst) in block.insts.iter().enumerate() {
+            match inst.kind {
+                InstKind::Spill { slot } => spans.push((slot, i, i)),
+                InstKind::Reload { slot } => {
+                    let span = spans.iter_mut().find(|s| s.0 == slot);
+                    span.expect("reload follows its store in the block").2 = i;
+                }
+                _ => {}
+            }
+        }
+        // New slot -> last reload of its current content.
+        let mut busy_until: Vec<usize> = Vec::new();
+        let mut renamed: HashMap<u32, u32> = HashMap::new();
+        for (slot, store, last_reload) in spans {
+            let new = match busy_until.iter().position(|&end| end < store) {
+                Some(new) => new,
+                None => {
+                    busy_until.push(0);
+                    busy_until.len() - 1
+                }
+            };
+            busy_until[new] = last_reload;
+            renamed.insert(slot, new as u32);
+        }
+        slots = slots.max(busy_until.len() as u32);
+        for inst in &mut block.insts {
+            if let InstKind::Spill { slot } | InstKind::Reload { slot } =
+                &mut inst.kind
+            {
+                *slot = renamed[slot];
+            }
+        }
+    }
+    slots
+}
+
 /// Inserts spills and reloads until at most `NUM_REGS` values are live at
 /// every definition. A victim must not be used by the instruction at the
 /// overflow and must have all its remaining uses later in the same block; of
@@ -271,14 +315,34 @@ fn spill(func: &mut Func) -> Result<u32, AllocError> {
                 func.blocks[b].insts.iter().zip(&live.after[b]).enumerate()
             {
                 let Some(d) = inst.def else { continue };
-                let pressure = after.iter().filter(|&t| t != d).count() + 1;
+                let mut pressure = after.iter().filter(|&t| t != d).count() + 1;
+                // A tied op whose accumulator stays live copies it first, so
+                // the result cannot take the register of an operand that
+                // dies here.
+                if let (InstKind::Op { tied: true }, Some(&Some(acc))) =
+                    (inst.kind, inst.uses.first())
+                    && after.contains(acc)
+                {
+                    let mut dying: Vec<Tok> = inst
+                        .uses
+                        .iter()
+                        .flatten()
+                        .copied()
+                        .filter(|&u| !after.contains(u))
+                        .collect();
+                    dying.sort_unstable();
+                    dying.dedup();
+                    pressure += dying.len();
+                }
                 if pressure > NUM_REGS as usize {
                     overflow = Some((b, i, pressure));
                     break 'search;
                 }
             }
         }
-        let Some((b, i, pressure)) = overflow else { return Ok(slots) };
+        let Some((b, i, pressure)) = overflow else {
+            return Ok(if slots == 0 { 0 } else { share_slots(func) });
+        };
         let block = &func.blocks[b];
         let live_out = live.after[b].last().unwrap();
         let inst = &block.insts[i];
@@ -676,8 +740,8 @@ mod tests {
 
     #[test]
     fn straight_line_overflow_spills() {
-        // 31 values defined, then each used once: one must be spilled.
-        let n = 31;
+        // 17 values defined, then each used once: one must be spilled.
+        let n = 17;
         let mut insts: Vec<Inst> = (0..n).map(|t| op(Some(t), &[])).collect();
         insts.extend((0..n).map(|t| op(None, &[Some(t)])));
         let mut f = Func {
@@ -687,21 +751,53 @@ mod tests {
         let a = allocate(&mut f).unwrap();
         assert_eq!(a.slots, 1);
         let insts = &f.blocks[0].insts;
-        // t29 is used last, so it is the one stored before t30's definition
-        // and reloaded (as t31) right before its use.
-        assert_eq!(insts[30].kind, InstKind::Spill { slot: 0 });
-        assert_eq!(insts[30].uses, [Some(29)]);
-        assert_eq!(insts[31].def, Some(30));
-        assert_eq!(insts[61].kind, InstKind::Reload { slot: 0 });
-        assert_eq!(insts[61].def, Some(31));
-        assert_eq!(insts[62].uses, [Some(31)]);
-        assert_eq!(insts.len(), 64);
+        // t15 is used last, so it is the one stored before t16's definition
+        // and reloaded (as t17) right before its use.
+        assert_eq!(insts[16].kind, InstKind::Spill { slot: 0 });
+        assert_eq!(insts[16].uses, [Some(15)]);
+        assert_eq!(insts[17].def, Some(16));
+        assert_eq!(insts[33].kind, InstKind::Reload { slot: 0 });
+        assert_eq!(insts[33].def, Some(17));
+        assert_eq!(insts[34].uses, [Some(17)]);
+        assert_eq!(insts.len(), 36);
+    }
+
+    #[test]
+    fn spills_that_do_not_overlap_share_a_slot() {
+        // Twice: 17 values defined, then each used once.
+        let n = 17;
+        let mut insts = Vec::new();
+        for base in [0, n] {
+            insts.extend((base..base + n).map(|t| op(Some(t), &[])));
+            insts.extend((base..base + n).map(|t| op(None, &[Some(t)])));
+        }
+        let mut f = Func {
+            blocks: vec![block(&[], vec![], insts)],
+            num_tokens: 2 * n as usize,
+        };
+        assert_eq!(allocate(&mut f).unwrap().slots, 1);
+    }
+
+    #[test]
+    fn tied_op_with_live_accumulator_spills() {
+        // 16 values, then t16 = acc(t0, t1) with t0 still live and t1 dead:
+        // the copy of t0 needs a 17th register, so one value is spilled.
+        let n = 16;
+        let mut insts: Vec<Inst> = (0..n).map(|t| op(Some(t), &[])).collect();
+        insts.push(acc(n, &[Some(0), Some(1)]));
+        insts.push(op(None, &[Some(0)]));
+        insts.extend((2..=n).map(|t| op(None, &[Some(t)])));
+        let mut f = Func {
+            blocks: vec![block(&[], vec![], insts)],
+            num_tokens: n as usize + 1,
+        };
+        assert_eq!(allocate(&mut f).unwrap().slots, 1);
     }
 
     #[test]
     fn too_many_live_across_blocks() {
-        // 31 values live out of the entry block cannot be spilled.
-        let n = 31;
+        // 17 values live out of the entry block cannot be spilled.
+        let n = 17;
         let insts: Vec<Inst> = (0..n).map(|t| op(Some(t), &[])).collect();
         let uses: Vec<Inst> = (0..n).map(|t| op(None, &[Some(t)])).collect();
         let mut f = Func {
@@ -712,15 +808,15 @@ mod tests {
             allocate(&mut f).err(),
             Some(AllocError::TooManyLive {
                 block: 0,
-                inst: Some(30),
-                live: 31
+                inst: Some(16),
+                live: 17
             })
         );
     }
 
     #[test]
-    fn thirty_live_fit() {
-        let n = 30;
+    fn sixteen_live_fit() {
+        let n = 16;
         let mut insts: Vec<Inst> = (0..n).map(|t| op(Some(t), &[])).collect();
         insts.push(op(None, &(0..n).map(Some).collect::<Vec<_>>()));
         let mut f = Func {

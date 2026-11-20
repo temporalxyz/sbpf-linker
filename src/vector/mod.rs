@@ -2,7 +2,7 @@
 //!
 //! Intrinsics reach the linker as calls to undefined `__svm_*` markers whose
 //! `i32` values are opaque SSA tokens. On the whole program after LTO, this
-//! pass allocates `v0`–`v29` to the tokens and replaces every marker call with
+//! pass allocates `v0`–`v15` to the tokens and replaces every marker call with
 //! side-effecting inline asm that emits the encoded `CALL_IMM src=2`
 //! instruction as one `.quad`. Programs without markers are left untouched.
 
@@ -807,7 +807,6 @@ impl Pass {
                                 st,
                                 word,
                                 Some(slots[slot as usize]),
-                                site.anchor(),
                             );
                         }
                         (InstKind::Reload { slot }, _) => {
@@ -819,7 +818,6 @@ impl Pass {
                                 ld,
                                 word,
                                 Some(slots[slot as usize]),
-                                site.anchor(),
                             );
                         }
                         (_, &Site::Op { call, op, scalar, imm8 }) => {
@@ -847,11 +845,7 @@ impl Pass {
                                 ops::encode(op.code, imm8, out, in0, in1),
                                 off,
                             );
-                            let result =
-                                self.emit_op(builder, op, word, scalar, call);
-                            if op.kind.defines_scalar() {
-                                LLVMReplaceAllUsesWith(call, result);
-                            }
+                            self.emit_op(builder, op, word, scalar);
                         }
                         (_, &Site::Select(select)) => {
                             LLVMPositionBuilderBefore(builder, select);
@@ -921,14 +915,13 @@ impl Pass {
         builder: LLVMBuilderRef,
         text: &str,
         constraints: &str,
-        ret: LLVMTypeRef,
         args: &[LLVMValueRef],
-    ) -> LLVMValueRef {
+    ) {
         unsafe {
             let mut arg_types: Vec<LLVMTypeRef> =
                 args.iter().map(|&a| LLVMTypeOf(a)).collect();
             let fn_ty = LLVMFunctionType(
-                ret,
+                LLVMVoidTypeInContext(self.context),
                 arg_types.as_mut_ptr(),
                 args.len() as u32,
                 0,
@@ -952,7 +945,7 @@ impl Pass {
                 args.as_mut_ptr(),
                 args.len() as u32,
                 c"".as_ptr(),
-            )
+            );
         }
     }
 
@@ -961,8 +954,7 @@ impl Pass {
     /// defining `r0`.
     unsafe fn emit_words(&self, builder: LLVMBuilderRef, words: &[u64]) {
         let text = quads(words);
-        let void = unsafe { LLVMVoidTypeInContext(self.context) };
-        unsafe { self.emit_asm(builder, &text, "~{r0}", void, &[]) };
+        unsafe { self.emit_asm(builder, &text, "~{r0}", &[]) };
     }
 
     unsafe fn emit_op(
@@ -971,28 +963,19 @@ impl Pass {
         op: &OpInfo,
         word: u64,
         scalar: Option<LLVMValueRef>,
-        call: LLVMValueRef,
-    ) -> LLVMValueRef {
+    ) {
         unsafe {
             let text = quads(&[word]);
             let mut constraints = Vec::new();
-            let ret = if op.kind.defines_scalar() {
-                constraints.push("={r0}");
-                LLVMTypeOf(call)
-            } else {
-                LLVMVoidTypeInContext(self.context)
-            };
             if scalar.is_some() {
                 constraints.push("{r1}");
             }
-            if !op.kind.defines_scalar() {
-                constraints.push("~{r0}");
-            }
+            constraints.push("~{r0}");
             if op.is_memory() {
                 constraints.push("~{memory}");
             }
             let args: Vec<LLVMValueRef> = scalar.into_iter().collect();
-            self.emit_asm(builder, &text, &constraints.join(","), ret, &args)
+            self.emit_asm(builder, &text, &constraints.join(","), &args);
         }
     }
 
@@ -1107,8 +1090,7 @@ impl Pass {
                 i64_ty,
                 c"".as_ptr(),
             );
-            let void = LLVMVoidTypeInContext(self.context);
-            self.emit_asm(builder, &text, "r,~{r0}", void, &[cond]);
+            self.emit_asm(builder, &text, "r,~{r0}", &[cond]);
         }
     }
 }
